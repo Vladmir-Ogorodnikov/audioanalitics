@@ -14,6 +14,7 @@ from .winfix import (
     check_ffmpeg,
     disk_report_lines,
     ensure_disk_space,
+    find_ffmpeg,
     setup_console,
 )
 
@@ -89,8 +90,12 @@ def _cmd_doctor(_a: argparse.Namespace) -> int:
         print(f"[{mark}] {name}" + (f" — {note}" if note else ""))
 
     report("Python", sys.version_info >= (3, 10), sys.version.split()[0])
-    ff = shutil.which("ffmpeg")
-    report("ffmpeg в PATH", ff is not None, ff or "winget install Gyan.FFmpeg, затем перезапустите терминал")
+    ff = shutil.which("ffmpeg") or find_ffmpeg()
+    if ff and not shutil.which("ffmpeg"):
+        report("ffmpeg", True,
+               f"найден вне PATH: {ff} (подключается автоматически; для cmd-команды `ffmpeg` добавьте в PATH папку {Path(ff).parent})")
+    else:
+        report("ffmpeg в PATH", ff is not None, ff or "winget install Gyan.FFmpeg, затем перезапустите терминал")
 
     try:
         import torch

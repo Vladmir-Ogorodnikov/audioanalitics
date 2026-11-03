@@ -74,7 +74,18 @@ def transcribe(audio_path: str | Path, cfg: SttConfig | None = None,
     say("Загрузка аудио")
     # HF_HUB_ENABLE_HF_TRANSFER=1 на Windows часто обрывает скачивание весов -> отключаем
     os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
-    audio = whisperx.load_audio(audio_path)  # требует ffmpeg в PATH
+    # ffmpeg может быть не в PATH, но найден в папках winget — подставим путь явно
+    kwargs = {}
+    try:
+        import inspect
+        if "ffmpeg_file" in inspect.signature(whisperx.load_audio).parameters:
+            from .winfix import find_ffmpeg
+            exe = find_ffmpeg()
+            if exe:
+                kwargs["ffmpeg_file"] = exe
+    except Exception:
+        pass
+    audio = whisperx.load_audio(audio_path, **kwargs)
 
     say(f"Распознавание речи ({cfg.model}, {device}, {compute_type})")
     model = whisperx.load_model(cfg.model, device, compute_type=compute_type, language=cfg.language)

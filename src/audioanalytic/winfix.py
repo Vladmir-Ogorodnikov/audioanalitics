@@ -56,14 +56,74 @@ def allow_pyannote_unpickling() -> None:
     torch.load = patched  # type: ignore[assignment]
 
 
+# Типичные места, куда winget/сборщики кладут ffmpeg.exe (Windows)
+_WIN_FFMPEG_GLOBS = [
+    r"%LOCALAPPDATA%\Microsoft\WinGet\Packages\**\bin\ffmpeg.exe",
+    r"%ProgramFiles%\ffmpeg\**\bin\ffmpeg.exe",
+    r"%ChocolateyInstall%\bin\ffmpeg.exe",
+    r"%USERPROFILE%\scoop\apps\ffmpeg\current\bin\ffmpeg.exe",
+]
+
+
+def find_ffmpeg() -> str | None:
+    """Полный путь к ffmpeg.exe: сначала PATH, потом типовые папки winget/scoop/choco.
+
+    Возвращает путь к исполняемому файлу (а не к папке bin) — так его можно
+    подставить напрямую в whisperx.load_audio(..., ffmpeg_file=...), даже если
+    пользователь так и не смог добавить ffmpeg в PATH.
+    """
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    if os.name != "nt":
+        return None
+    for pattern in _WIN_FFMPEG_GLOBS:
+        expanded = os.path.expandvars(pattern)
+        try:
+            matches = sorted(Path(expanded).parent.glob("**/" + Path(expanded).name))
+        except OSError:
+            continue
+        if matches:
+            return str(matches[0])
+    return None
+
+
+def ffmpeg_bin_dir() -> str | None:
+    """Папка, содержащая ffmpeg.exe (нужна для подсказки по PATH)."""
+    exe = find_ffmpeg()
+    return str(Path(exe).parent) if exe else None
+
+
+def path_add_hint(bin_dir: str) -> list[str]:
+    """Команды, которые добавляют bin_dir в PATH пользователя без GUI."""
+    return [
+        f'setx PATH "%PATH%;{bin_dir}"   :: затем ЗАКРЫТЬ все окна cmd и открыть новое',
+        f':: либо разово в текущем окне: set "PATH=%PATH%;{bin_dir}"',
+    ]
+
+
 def check_ffmpeg() -> None:
-    """ffmpeg должен быть в PATH — иначе whisperx.load_audio падает без внятной ошибки."""
-    if shutil.which("ffmpeg") is None:
-        raise RuntimeError(
-            "ffmpeg не найден в PATH. Установите его, например: winget install Gyan.FFmpeg "
-            "(после установки перезапустите терминал), либо скачайте сборку с ffmpeg.org "
-            "и добавьте папку bin\\ в переменную PATH."
-        )
+    """ffmpeg нужен для декодирования аудио — иначе whisperx.load_audio падает.
+
+    Если ffmpeg не в PATH, но найден в типовых папках (winget и т.п.) —
+    молча добавляем его папку в PATH текущего процесса: команды уже запущенного
+    терминала (audioanalytic ...) будут работать без перезапуска окна.
+    """
+    if shutil.which("ffmpeg"):
+        return
+    exe = find_ffmpeg()
+    if exe:
+        bindir = str(Path(exe).parent)
+        os.environ["PATH"] = bindir + os.pathsep + os.environ.get("PATH", "")
+        print(f"[OK ] ffmpeg найден вне PATH, подключён автоматически: {exe}")
+        print("      Чтобы работала команда `ffmpeg` в cmd — добавьте в PATH: " + bindir)
+        return
+    raise RuntimeError(
+        "ffmpeg не найден (ни в PATH, ни в типовых папках winget/scoop/choco).\n"
+        "Установите: winget install Gyan.FFmpeg, затем перезапустите терминал,\n"
+        "либо скачайте сборку с ffmpeg.org и добавьте папку bin\\ в переменную PATH\n"
+        "(sysdm.cpl → Дополнительно → Переменные среды → Path пользователя → Изменить → Создать)."
+    )
 
 
 # ── Место на диске ([Errno 28] No space left on device) ───────────────────────
