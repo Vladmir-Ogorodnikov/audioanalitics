@@ -19,6 +19,30 @@
    ```
    (для постоянного значения — «Изменение переменных среды» в свойствах системы). Веса скачиваются один раз, дальше всё работает офлайн. Без токена используйте `--no-diarize`.
 
+### Как получить токен Hugging Face (нужен только для диаризации)
+1. Зарегистрируйтесь на https://huggingface.co (или войдите).
+2. Откройте страницу модели, которую использует WhisperX для диаризации:
+   **https://huggingface.co/pyannote/speaker-diarization-community-1**
+   и примите её условия (кнопка **«Agree to terms»** / «Accept license» под описанием модели). Пока условия не приняты, запрос весов вернёт ошибку 401/403 даже с валидным токеном.
+3. Создайте token: https://huggingface.co/settings/tokens → **«New token»** → тип **Read** (Fine-grained тоже подойдёт, главное — Read-доступ к репозиториям pyannote) → скопируйте строку вида `hf_abcd...`. Токен показывается один раз.
+4. Задайте его в окружении Windows (в том же окне cmd, где запускаете программу):
+   ```bat
+   set HF_TOKEN=hf_abcd...        :: временно, до закрытия окна
+   ```
+   или постоянно: Win+R → `sysdm.cpl` → «Дополнительно» → «Переменные среды» → создать переменную `HF_TOKEN`, затем перезапустить терминал.
+   Альтернатива через CLI hf (токен сохранится в `C:\Users\<you>\.cache\huggingface\token`):
+   ```bat
+   pip install -U "huggingface_hub[cli]"
+   hf auth login        :: вставить токен при запросе
+   ```
+5. Проверьте: `audioanalytic doctor` — строка `HF_TOKEN` должна быть `[OK ]`. Первый прогон с диаризацией скачает веса pyannote и wav2vec2 (align-модель для русского — тоже gated, если 403 — примите условия и на https://huggingface.co/facebook/wav2vec2-large-xlsr-53-russian).
+
+Быстрая проверка валидности токена из PowerShell:
+```powershell
+Invoke-RestMethod -Uri "https://huggingface.co/api/whoami-v2" -Headers @{Authorization="Bearer $env:HF_TOKEN"}
+```
+(в cmd можно так: `curl -H "Authorization: Bearer %HF_TOKEN%" https://huggingface.co/api/whoami-v2`)
+
 ### Типичные проблемы Windows (обходные пути уже встроены в код)
 - **`UnicodeEncodeError` при выводе кириллицы/символов** — CLI сам переключает stdout/stderr в UTF-8 (`winfix.setup_console`). Если печатаете из своего кода — запускайте с `set PYTHONUTF8=1`.
 - **`UnpicklingError` при диаризации** (torch ≥ 2.6 по умолчанию блокирует веса pyannote) — CLI автоматически разрешает загрузку этих чекпойнтов (`winfix.allow_pyannote_unpickling`).
