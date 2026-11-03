@@ -9,7 +9,13 @@ from pathlib import Path
 from .config import SttConfig, load_dotenv
 from .formatting import chunk_for_llm, to_text
 from .models import Transcript
-from .winfix import allow_pyannote_unpickling, check_ffmpeg, setup_console
+from .winfix import (
+    allow_pyannote_unpickling,
+    check_ffmpeg,
+    disk_report_lines,
+    ensure_disk_space,
+    setup_console,
+)
 
 AUDIO_EXT = {".mp3", ".wav", ".flac"}
 MAX_BYTES = 1024 ** 3  # ограничение ТЗ: до 1 ГБ на файл
@@ -41,6 +47,11 @@ def _cmd_transcribe(a: argparse.Namespace) -> int:
         cfg.device = "cpu"
 
     allow_pyannote_unpickling()  # диаризация pyannote + torch>=2.6
+    try:
+        ensure_disk_space(3, "скачивания весов моделей")  # иначе Errno 28 в середине прогона
+    except RuntimeError as e:
+        print(e, file=sys.stderr)
+        return 4
     from .stt import transcribe  # тяжёлые импорты только здесь
     tr = transcribe(src, cfg, progress=lambda m: print(f"• {m}", flush=True))
 
@@ -100,6 +111,9 @@ def _cmd_doctor(_a: argparse.Namespace) -> int:
     report("HF_TOKEN", tok is not None,
             "задан" if tok else
             "не задан — диаризация будет недоступна (.env / set HF_TOKEN=hf_...)")
+
+    for name, good, note in disk_report_lines():
+        report(name, good, note)
 
     print("Готов к работе" if ok else "Есть проблемы — см. строки с [!!]")
     return 0 if ok else 1
