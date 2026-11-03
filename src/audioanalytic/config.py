@@ -3,6 +3,27 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
+
+
+def load_dotenv(path: str | Path = ".env") -> None:
+    """Минимальный загрузчик .env (без зависимостей): HF_TOKEN и т.п.
+
+    Читает файл вида KEY=VALUE (строки с '#' и пустые пропускаются), значения в
+    кавычках снимаются. Уже установленные переменные окружения НЕ перезаписывает:
+    приоритет у `set HF_TOKEN=...` / системных переменных Windows.
+    """
+    p = Path(path)
+    if not p.is_file():
+        return
+    for raw in p.read_text(encoding="utf-8-sig").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip().strip("'\"")
+        if key and val and key not in os.environ:
+            os.environ[key] = val
 
 
 @dataclass

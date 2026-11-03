@@ -6,7 +6,7 @@ import logging
 import sys
 from pathlib import Path
 
-from .config import SttConfig
+from .config import SttConfig, load_dotenv
 from .formatting import chunk_for_llm, to_text
 from .models import Transcript
 from .winfix import allow_pyannote_unpickling, check_ffmpeg, setup_console
@@ -98,7 +98,8 @@ def _cmd_doctor(_a: argparse.Namespace) -> int:
 
     tok = SttConfig().hf_token
     report("HF_TOKEN", tok is not None,
-            "задан" if tok else "не задан — диаризация будет недоступна (--no-diarize или set HF_TOKEN=hf_...)")
+            "задан" if tok else
+            "не задан — диаризация будет недоступна (.env / set HF_TOKEN=hf_...)")
 
     print("Готов к работе" if ok else "Есть проблемы — см. строки с [!!]")
     return 0 if ok else 1
@@ -106,6 +107,7 @@ def _cmd_doctor(_a: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     setup_console()  # UTF-8 в консоли Windows (cp1251/cp866 по умолчанию)
+    load_dotenv()    # подхватываем HF_TOKEN из .env в папке проекта (если есть)
     p = argparse.ArgumentParser(prog="audioanalytic")
     sub = p.add_subparsers(dest="cmd", required=True)
 
