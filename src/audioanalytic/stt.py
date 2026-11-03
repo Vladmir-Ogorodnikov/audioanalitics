@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
 from pathlib import Path
 from typing import Callable
 
@@ -56,10 +57,23 @@ def transcribe(audio_path: str | Path, cfg: SttConfig | None = None,
     import whisperx
 
     device = _resolve_device(cfg.device)
-    compute_type = cfg.compute_type if device == "cuda" else "int8"
+    if device == "cuda":
+        import torch
+        if not torch.cuda.is_available():
+            say("CUDA не доступна — переключаюсь на CPU")
+            device = "cpu"
+    # int8_float16/float16 на CPU падают внутри ctranslate2 -> понижаем до int8
+    if device == "cuda":
+        compute_type = cfg.compute_type
+    else:
+        if cfg.compute_type != "int8":
+            say(f"CPU: compute_type '{cfg.compute_type}' заменён на 'int8'")
+        compute_type = "int8"
     audio_path = str(audio_path)
 
     say("Загрузка аудио")
+    # HF_HUB_ENABLE_HF_TRANSFER=1 на Windows часто обрывает скачивание весов -> отключаем
+    os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
     audio = whisperx.load_audio(audio_path)  # требует ffmpeg в PATH
 
     say(f"Распознавание речи ({cfg.model}, {device}, {compute_type})")
@@ -69,7 +83,20 @@ def transcribe(audio_path: str | Path, cfg: SttConfig | None = None,
     _free_memory()
 
     say("Выравнивание по словам")
-    align_model, meta = whisperx.load_align_model(language_code=cfg.language, device=device)
+    try:
+        align_model, meta = whisperx.load_align_model(language_code=cfg.language, device=device)
+    except Exception as e:
+        # Типичная проблема на Windows/русских сборках: locale cp1251 и кириллица
+        # в пути к кэшу HF -> UnicodeDecodeError при загрузке весов.
+        if "codec" in str(e) or "unicode" in str(e).lower():
+            raise RuntimeError(
+                f"Не удалось загрузить модель выравнивания: {e}\n"
+                "Решение для Windows: задайте UTF-8 перед запуском —\n"
+                "  set PYTHONUTF8=1\n"
+                "или включите «Beta: Use Unicode UTF-8 for worldwide language support» "
+                "в Параметры -> Язык и регион -> Административные параметры языка."
+            ) from e
+        raise
     result = whisperx.align(result["segments"], align_model, meta, audio, device,
                             return_char_alignments=False)
     del align_model
