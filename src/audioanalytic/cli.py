@@ -9,6 +9,7 @@ from pathlib import Path
 from .config import SttConfig
 from .formatting import chunk_for_llm, to_text
 from .models import Transcript
+from .winfix import allow_pyannote_unpickling, check_ffmpeg, setup_console
 
 AUDIO_EXT = {".mp3", ".wav", ".flac"}
 MAX_BYTES = 1024 ** 3  # ограничение ТЗ: до 1 ГБ на файл
@@ -19,16 +20,27 @@ def _cmd_transcribe(a: argparse.Namespace) -> int:
     if src.suffix.lower() not in AUDIO_EXT:
         print(f"Формат {src.suffix} не поддерживается (MP3, WAV, FLAC)", file=sys.stderr)
         return 2
-    if not src.is_file() or src.stat().st_size > MAX_BYTES:
-        print("Файл не найден или больше 1 ГБ", file=sys.stderr)
+    if not src.is_file():
+        print(f"Файл не найден: {src}", file=sys.stderr)
         return 2
+    if src.stat().st_size > MAX_BYTES:
+        print("Файл больше 1 ГБ", file=sys.stderr)
+        return 2
+    try:
+        check_ffmpeg()
+    except RuntimeError as e:
+        print(e, file=sys.stderr)
+        return 3
 
     make = SttConfig.low_vram if a.low_vram else SttConfig
     cfg = make(language=a.language, diarize=not a.no_diarize,
                num_speakers=a.speakers, min_speakers=a.min_speakers, max_speakers=a.max_speakers)
     if a.model:
         cfg.model = a.model
+    if getattr(a, "cpu", False):
+        cfg.device = "cpu"
 
+    allow_pyannote_unpickling()  # диаризация pyannote + torch>=2.6
     from .stt import transcribe  # тяжёлые импорты только здесь
     tr = transcribe(src, cfg, progress=lambda m: print(f"• {m}", flush=True))
 
@@ -52,7 +64,48 @@ def _cmd_chunks(a: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_doctor(_a: argparse.Namespace) -> int:
+    """Проверка окружения: python, ffmpeg, torch/CUDA, whisperx, HF_TOKEN."""
+    import shutil
+
+    ok = True
+
+    def report(name: str, good: bool, note: str = "") -> None:
+        nonlocal ok
+        mark = "OK " if good else "!! "
+        if not good:
+            ok = False
+        print(f"[{mark}] {name}" + (f" — {note}" if note else ""))
+
+    report("Python", sys.version_info >= (3, 10), sys.version.split()[0])
+    ff = shutil.which("ffmpeg")
+    report("ffmpeg в PATH", ff is not None, ff or "winget install Gyan.FFmpeg, затем перезапустите терминал")
+
+    try:
+        import torch
+        cuda = torch.cuda.is_available()
+        name = torch.cuda.get_device_name(0) if cuda else "нет CUDA, будет CPU (медленнее)"
+        report("torch / CUDA", True, f"torch {torch.__version__}, {name}")
+    except ImportError:
+        report("torch", False,
+               "pip install torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128")
+
+    try:
+        import whisperx
+        report("whisperx", True, getattr(whisperx, "__version__", "установлен"))
+    except ImportError:
+        report("whisperx", False, "pip install -e .[dev] из папки проекта")
+
+    tok = SttConfig().hf_token
+    report("HF_TOKEN", tok is not None,
+            "задан" if tok else "не задан — диаризация будет недоступна (--no-diarize или set HF_TOKEN=hf_...)")
+
+    print("Готов к работе" if ok else "Есть проблемы — см. строки с [!!]")
+    return 0 if ok else 1
+
+
 def main(argv: list[str] | None = None) -> int:
+    setup_console()  # UTF-8 в консоли Windows (cp1251/cp866 по умолчанию)
     p = argparse.ArgumentParser(prog="audioanalytic")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -62,6 +115,7 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--language", default="ru")
     t.add_argument("--model", help="например large-v3, large-v3-turbo")
     t.add_argument("--low-vram", action="store_true", help="профиль для GPU 8 ГБ")
+    t.add_argument("--cpu", action="store_true", help="принудительно CPU (без CUDA)")
     t.add_argument("--no-diarize", action="store_true")
     t.add_argument("--speakers", type=int, help="точное число спикеров")
     t.add_argument("--min-speakers", type=int)
@@ -72,6 +126,9 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("transcript")
     c.add_argument("--max-chars", type=int, default=12000)
     c.set_defaults(fn=_cmd_chunks)
+
+    d = sub.add_parser("doctor", help="проверка окружения (ffmpeg, CUDA, whisperx, HF_TOKEN)")
+    d.set_defaults(fn=_cmd_doctor)
 
     a = p.parse_args(argv)
     logging.basicConfig(level=logging.WARNING)
