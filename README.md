@@ -91,6 +91,8 @@ CUDA-сборка torch — это wheel ~3.5 ГБ, который pip снач�
 - **float16/int8_float16 не работают на CPU** (ограничение ctranslate2) — программа сама переключится на `int8` и на CPU, если CUDA не найдена. Можно задать явно: `--cpu`.
 - **Скачивание весов обрывается** — для стабильности отключён `hf_transfer` (однопоточная загрузка).
 - **Отсутствует ffmpeg** — CLI сообщит об этом понятной подсказкой вместо cryptic-ошибки внутри whisperx.
+- **`Could not load libtorchcodec_core*.dll` / «torchcodec is not installed correctly»** — предупреждение torchaudio о сломанном декодере на Windows. Программа больше не падает: после предобработки подготовленный WAV читается напрямую (soundfile/stdlib `wave`) в обход torchcodec. Полное решение — переустановить парные версии: `pip install torch==2.8.0 torchaudio==2.8.0` и `pip install torchcodec --index-url https://download.pytorch.org/whl/cpu` (см. таблицу совместимости torchcodec), либо игнорировать — fallback отработает сам.
+- **«Error applying option 'measured_input_i' to filter 'loudnorm': Option not found»** — исправлено: второй проход loudnorm теперь использует корректные имена параметров (`measured_I`, `measured_TP`, `measured_LRA`, `measured_thresh`, `offset`). Также добавлен `-vn`, чтобы прикреплённая обложка (attached pic) в MP3 из YouTube не ломала запись WAV.
 - **AMD Radeon RX 6600 XT** не поддерживается WhisperX/CTranslate2 на Windows (нет CUDA) — только CPU. Это стоит отразить как ограничение в ТЗ.
 
 ## Использование
