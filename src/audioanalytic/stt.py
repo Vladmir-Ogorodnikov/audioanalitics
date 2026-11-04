@@ -71,14 +71,41 @@ def transcribe(audio_path: str | Path, cfg: SttConfig | None = None,
         compute_type = "int8"
     audio_path = str(audio_path)
 
+    # FR-02: предобработка — 16 кГц, моно, -16 LUFS (улучшает WER на тихих/громких записях)
+    if cfg.preprocess:
+        say("Предобработка аудио (16 кГц, моно, −16 LUFS)")
+        from .preprocess import preprocess
+        audio_path = str(preprocess(audio_path))
+
     say("Загрузка аудио")
     # HF_HUB_ENABLE_HF_TRANSFER=1 на Windows часто обрывает скачивание весов -> отключаем
     os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
-    audio = whisperx.load_audio(audio_path)  # требует ffmpeg в PATH
+    # ffmpeg может быть не в PATH, но найден в папках winget — подставим путь явно
+    kwargs = {}
+    try:
+        import inspect
+        if "ffmpeg_file" in inspect.signature(whisperx.load_audio).parameters:
+            from .winfix import find_ffmpeg
+            exe = find_ffmpeg()
+            if exe:
+                kwargs["ffmpeg_file"] = exe
+    except Exception:
+        pass
+    audio = whisperx.load_audio(audio_path, **kwargs)
 
     say(f"Распознавание речи ({cfg.model}, {device}, {compute_type})")
+    # FR-03: словарь терминов -> initial prompt Whisper (частично компенсирует
+    # отсутствие дообучения; подсказка помогает модели выбирать правильные термины)
+    from .lexicon import (apply_censorship, build_initial_prompt, load_badwords,
+                          load_terms, term_coverage)
+    terms = load_terms(cfg.terms_file) if cfg.terms_file else []
+    initial_prompt = build_initial_prompt(terms)
+    if initial_prompt:
+        say(f"Словарь терминов: {len(terms)} слов, initial prompt задан")
+
     model = whisperx.load_model(cfg.model, device, compute_type=compute_type, language=cfg.language)
-    result = model.transcribe(audio, batch_size=cfg.batch_size, language=cfg.language)
+    result = model.transcribe(audio, batch_size=cfg.batch_size, language=cfg.language,
+                              initial_prompt=initial_prompt)
     del model
     _free_memory()
 
@@ -119,4 +146,16 @@ def transcribe(audio_path: str | Path, cfg: SttConfig | None = None,
         _free_memory()
 
     say("Готово")
-    return _to_transcript(result, cfg.language, Path(audio_path).name)
+    tr = _to_transcript(result, cfg.language, Path(audio_path).name)
+
+    # FR-03: маркировка ненормативной лексики меткой [НБЗ]
+    if cfg.censor:
+        roots = load_badwords(cfg.badwords_file)
+        n = apply_censorship(tr.segments, roots)
+        if n:
+            log.info("Маркировано [НБЗ]: %d", n)
+    # метрика полноты терминов (для отчётов; не влияет на текст)
+    if terms:
+        full_text = " ".join(s.text for s in tr.segments)
+        tr.meta["term_coverage"] = term_coverage(full_text, terms)
+    return tr

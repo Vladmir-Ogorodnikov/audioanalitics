@@ -39,3 +39,20 @@ def test_chunks_command(tmp_path):
     assert chunks, "файлы частей не созданы"
     text = "\n".join(c.read_text(encoding="utf-8") for c in chunks)
     assert "Первая реплика." in text and "[00:00:10] SPEAKER_01" in text
+
+
+def test_doctor_reports_disk(tmp_path, capsys, monkeypatch):
+    # doctor не должен падать и обязан показать строки про диск/кэши
+    assert main(["doctor"]) in (0, 1)
+    out = capsys.readouterr().out
+    assert "Диск" in out and "Кэш pip" in out
+
+
+def test_ensure_disk_space_message(monkeypatch, capsys):
+    import pytest
+    from audioanalytic import winfix
+
+    monkeypatch.setattr(winfix, "free_gb", lambda path=None: 1.0)
+    with pytest.raises(RuntimeError) as e:
+        winfix.ensure_disk_space(5, "тест")
+    assert "PIP_CACHE_DIR" in str(e.value)

@@ -9,7 +9,14 @@ from pathlib import Path
 from .config import SttConfig, load_dotenv
 from .formatting import chunk_for_llm, to_text
 from .models import Transcript
-from .winfix import allow_pyannote_unpickling, check_ffmpeg, setup_console
+from .winfix import (
+    allow_pyannote_unpickling,
+    check_ffmpeg,
+    disk_report_lines,
+    ensure_disk_space,
+    find_ffmpeg,
+    setup_console,
+)
 
 AUDIO_EXT = {".mp3", ".wav", ".flac"}
 MAX_BYTES = 1024 ** 3  # ограничение ТЗ: до 1 ГБ на файл
@@ -39,8 +46,17 @@ def _cmd_transcribe(a: argparse.Namespace) -> int:
         cfg.model = a.model
     if getattr(a, "cpu", False):
         cfg.device = "cpu"
+    cfg.preprocess = not a.no_preprocess
+    cfg.terms_file = a.terms
+    cfg.badwords_file = a.badwords
+    cfg.censor = not a.no_censor
 
     allow_pyannote_unpickling()  # диаризация pyannote + torch>=2.6
+    try:
+        ensure_disk_space(3, "скачивания весов моделей")  # иначе Errno 28 в середине прогона
+    except RuntimeError as e:
+        print(e, file=sys.stderr)
+        return 4
     from .stt import transcribe  # тяжёлые импорты только здесь
     tr = transcribe(src, cfg, progress=lambda m: print(f"• {m}", flush=True))
 
@@ -64,6 +80,26 @@ def _cmd_chunks(a: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_evaluate(a: argparse.Namespace) -> int:
+    """Метрики WER/CER (и полноты терминов) транскрипта против эталонной расшифровки."""
+    from .metrics import cer, wer
+    from .lexicon import load_terms
+
+    tr = Transcript.from_dict(json.loads(Path(a.transcript).read_text(encoding="utf-8")))
+    hyp = " ".join(s.text for s in tr.segments)
+    ref = Path(a.reference).read_text(encoding="utf-8")
+    w, c = wer(ref, hyp), cer(ref, hyp)
+    print(f"WER: {w.rate:.2%}  (ошибок {w.errors} из {w.total}; "
+          f"замены {w.substitutions}, удаления {w.deletions}, вставки {w.insertions})")
+    print(f"CER: {c.rate:.2%}  (ошибок {c.errors} из {c.total})")
+    if a.terms:
+        from .lexicon import term_coverage
+        cov = term_coverage(hyp, load_terms(a.terms))
+        print(f"Полнота терминов: {cov['terms_found']}/{cov['terms_total']} "
+              f"= {cov['recall']:.1%}")
+    return 0
+
+
 def _cmd_doctor(_a: argparse.Namespace) -> int:
     """Проверка окружения: python, ffmpeg, torch/CUDA, whisperx, HF_TOKEN."""
     import shutil
@@ -78,8 +114,12 @@ def _cmd_doctor(_a: argparse.Namespace) -> int:
         print(f"[{mark}] {name}" + (f" — {note}" if note else ""))
 
     report("Python", sys.version_info >= (3, 10), sys.version.split()[0])
-    ff = shutil.which("ffmpeg")
-    report("ffmpeg в PATH", ff is not None, ff or "winget install Gyan.FFmpeg, затем перезапустите терминал")
+    ff = shutil.which("ffmpeg") or find_ffmpeg()
+    if ff and not shutil.which("ffmpeg"):
+        report("ffmpeg", True,
+               f"найден вне PATH: {ff} (подключается автоматически; для cmd-команды `ffmpeg` добавьте в PATH папку {Path(ff).parent})")
+    else:
+        report("ffmpeg в PATH", ff is not None, ff or "winget install Gyan.FFmpeg, затем перезапустите терминал")
 
     try:
         import torch
@@ -100,6 +140,9 @@ def _cmd_doctor(_a: argparse.Namespace) -> int:
     report("HF_TOKEN", tok is not None,
             "задан" if tok else
             "не задан — диаризация будет недоступна (.env / set HF_TOKEN=hf_...)")
+
+    for name, good, note in disk_report_lines():
+        report(name, good, note)
 
     print("Готов к работе" if ok else "Есть проблемы — см. строки с [!!]")
     return 0 if ok else 1
@@ -122,6 +165,11 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--speakers", type=int, help="точное число спикеров")
     t.add_argument("--min-speakers", type=int)
     t.add_argument("--max-speakers", type=int)
+    t.add_argument("--no-preprocess", action="store_true",
+                   help="пропустить предобработку FR-02 (16 кГц, моно, -16 LUFS)")
+    t.add_argument("--terms", help="файл словаря терминов (FR-03), по термину в строке")
+    t.add_argument("--badwords", help="файл списка НБЗ-слов (по умолчанию встроенный список)")
+    t.add_argument("--no-censor", action="store_true", help="не маркировать [НБЗ]")
     t.set_defaults(fn=_cmd_transcribe)
 
     c = sub.add_parser("chunks", help="transcript.json -> части для LLM")
@@ -131,6 +179,12 @@ def main(argv: list[str] | None = None) -> int:
 
     d = sub.add_parser("doctor", help="проверка окружения (ffmpeg, CUDA, whisperx, HF_TOKEN)")
     d.set_defaults(fn=_cmd_doctor)
+
+    e = sub.add_parser("evaluate", help="WER/CER транскрипта против эталона (NFR-01)")
+    e.add_argument("transcript", help="out/.../transcript.json")
+    e.add_argument("reference", help="эталонная ручная расшифровка (.txt)")
+    e.add_argument("--terms", help="словарь терминов для оценки полноты")
+    e.set_defaults(fn=_cmd_evaluate)
 
     a = p.parse_args(argv)
     logging.basicConfig(level=logging.WARNING)

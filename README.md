@@ -10,9 +10,13 @@
    cd C:\путь\к\проекту
    python -m venv .venv
    .venv\Scripts\activate
+   :: убедитесь, что на диске проекта (обычно C:) есть ~20 ГБ свободно — см. раздел ниже
    pip install torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+   pip cache purge        :: удалить скачанный wheel (~3.5 ГБ) после успешной установки
    pip install -e .[dev]
    ```
+   Если места мало или хочется ставить на другой диск — создайте venv там:
+   `python -m venv D:\venvs\audioanalytic` и активируйте `D:\venvs\audioanalytic\Scripts\activate`.
 4. **Диаризация** (по желанию): создайте токен на huggingface.co, примите условия модели `pyannote/speaker-diarization-community-1`, затем:
    ```bat
    set HF_TOKEN=hf_...
@@ -50,6 +54,35 @@
 Invoke-RestMethod -Uri "https://huggingface.co/api/whoami-v2" -Headers @{Authorization="Bearer $env:HF_TOKEN"}
 ```
 (в cmd можно так: `curl -H "Authorization: Bearer %HF_TOKEN%" https://huggingface.co/api/whoami-v2`)
+
+### Не хватает места на диске (`[Errno 28] No space left on device`)
+CUDA-сборка torch — это wheel ~3.5 ГБ, который pip сначала качает в кэш, а потом
+распаковывает в venv: итого нужно **~10–12 ГБ только на torch** и ещё несколько ГБ
+на веса моделей (WhisperX скачивает их при первом прогоне). Всё это по умолчанию
+пишется на диск `C:`. Что делать:
+
+1. Освободите кэш pip (это безопасно, он только для повторных установок):
+   ```bat
+   pip cache purge
+   :: или вручную удалите папку: %LOCALAPPDATA%\pip\Cache
+   ```
+2. Перенесите кэш pip на другой диск (например, D:) — задайте переменную ОДИН раз:
+   ```bat
+   setx PIP_CACHE_DIR "D:\pip-cache"
+   ```
+   затем **перезапустите терминал** (setx действует только в новых окнах) и повторите установку.
+3. Перенесите кэш моделей Hugging Face (он тоже разрастается на гигабайты):
+   ```bat
+   setx HF_HOME "D:\hf-cache"
+   ```
+4. Альтернатива/дополнение — создайте venv не на C:, а на свободном диске:
+   ```bat
+   python -m venv D:\venvs\audioanalytic
+   D:\venvs\audioanalytic\Scripts\activate
+   ```
+5. После успешной установки torch можно сделать `pip cache purge` — wheel больше не нужен.
+6. Проверьте, где сколько места и сколько заняли кэши: `audioanalytic doctor`
+   покажет строки «Диск», «Кэш pip», «Кэш huggingface» с размером в ГБ.
 
 ### Типичные проблемы Windows (обходные пути уже встроены в код)
 - **`UnicodeEncodeError` при выводе кириллицы/символов** — CLI сам переключает stdout/stderr в UTF-8 (`winfix.setup_console`). Если печатаете из своего кода — запускайте с `set PYTHONUTF8=1`.

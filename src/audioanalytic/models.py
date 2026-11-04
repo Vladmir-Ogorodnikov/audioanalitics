@@ -28,6 +28,7 @@ class Transcript:
     language: str
     segments: list[Segment]
     source: str = ""
+    meta: dict = field(default_factory=dict)  # term_coverage, флаги предобработки и т.п.
 
     @property
     def duration(self) -> float:
@@ -46,4 +47,5 @@ class Transcript:
             )
             for s in d["segments"]
         ]
-        return cls(language=d["language"], segments=segs, source=d.get("source", ""))
+        return cls(language=d["language"], segments=segs, source=d.get("source", ""),
+                   meta=d.get("meta", {}))
