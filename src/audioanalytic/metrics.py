@@ -14,17 +14,20 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from .models import UNKNOWN_SPEAKER
+
 _PUNCT_RE = re.compile(r"[.,!?;:\"'()\[\]«»…\-—–]")
 
 
 def normalize(text: str) -> str:
     """Нижний регистр, удаление метки [НБЗ] и пунктуации.
 
-    Важно: .lower() вызывается ДО удаления пунктуации, иначе скобки «[НБЗ]»
-    помешают совпадению метки (нижний регистр от «НБЗ» — «нбз»).
+    Метка удаляется до снятия пунктуации, иначе скобки «[]» разобьются на
+    отдельные токены. Пробелы схлопываются, чтобы не появлялись пустые слова.
     """
-    t = text.lower().replace("[нбз]", " ")
-    return _PUNCT_RE.sub(" ", t).strip()
+    t = re.sub(r"\[нбз\]", " ", text.lower(), flags=re.IGNORECASE)
+    t = _PUNCT_RE.sub(" ", t)
+    return " ".join(t.split())
 
 
 def words(text: str) -> list[str]:
@@ -41,6 +44,10 @@ def edit_distance(ref: list[str], hyp: list[str]) -> tuple[int, int, int, int]:
 
     Сравнение чувствительно к регистру: WER/CER считаются на словах как есть
     (TTR-стиль); нормализация регистра — ответственность normalize().
+
+    При бэктрейсинге сначала проверяется diagonal (замена/совпадение), затем
+    удаление и вставка — иначе путь с заменой ошибочно разлагается на пару
+    «удаление + вставка» и статистика sub/ins искажается при равной стоимости.
     """
     n, m = len(ref), len(hyp)
     d = [[0] * (m + 1) for _ in range(n + 1)]
@@ -82,17 +89,38 @@ class ErrorRate:
 
 
 def wer(reference: str, hypothesis: str) -> ErrorRate:
-    r, h = words(reference), words(hypothesis)
+    # WER считается без нормализации регистра (TTR-стиль): normalize() ниже
+    # не вызывается, только удаление метки [НБЗ] и пунктуации.
+    r = _for_scoring(reference).split()
+    h = _for_scoring(hypothesis).split()
     dist, s, d_, i = edit_distance(r, h)
     total = len(r)
     return ErrorRate(dist / total if total else 0.0, dist, total, s, d_, i)
 
 
 def cer(reference: str, hypothesis: str) -> ErrorRate:
-    r, h = chars(reference), chars(hypothesis)
+    # CER — по символам исходного текста с учётом регистра (TTR-стиль);
+    # метка [НБЗ] вырезается целиком, чтобы маркировка не завышала CER.
+    r = _chars_raw(reference)
+    h = _chars_raw(hypothesis)
     dist, s, d_, i = edit_distance(r, h)
     total = len(r)
     return ErrorRate(dist / total if total else 0.0, dist, total, s, d_, i)
+
+
+_NBZ_RE = re.compile(r"\[нбз\]", flags=re.IGNORECASE)
+
+
+def _for_scoring(text: str) -> str:
+    """Для WER: нижний регистр НЕ приводим; убираем только метку [НБЗ] и пунктуацию."""
+    t = _NBZ_RE.sub(" ", text)
+    t = _PUNCT_RE.sub(" ", t)
+    return " ".join(t.split())
+
+
+def _chars_raw(text: str) -> list[str]:
+    t = _NBZ_RE.sub("", text)
+    return [c for c in t if not c.isspace()]
 
 
 # --- DER ---------------------------------------------------------------------
@@ -165,6 +193,18 @@ def _scored(segs: list[Interval], collar: float) -> list[tuple[float, float]]:
     return _merge(res)
 
 
+def _scored_intervals(intervals: list[tuple[float, float]],
+                      bounds: list[float], collar: float) -> list[tuple[float, float]]:
+    """То же, что _scored, но для плоского списка интервалов с явным списком
+    границ, вокруг которых вырезаются защитные зоны (нужно для confusion:
+    границы берём от ПОЛНОГО набора сегментов, а не от одного имени)."""
+    excl = [(max(0.0, b - collar), b + collar) for b in sorted(set(bounds))]
+    res: list[tuple[float, float]] = []
+    for s, e in intervals:
+        res.extend(_subtract([(s, e)], excl))
+    return _merge(res)
+
+
 def der(reference: list[Interval], hypothesis: list[Interval],
         collar: float = 0.25) -> ErrorRate:
     """Упрощённый DER (как в pyannote, но с полным перебором имён спикеров —
@@ -188,26 +228,34 @@ def der(reference: list[Interval], hypothesis: list[Interval],
     fa = max(0.0, _total(hyp_scored) - covered)
 
     # лучшее сопоставление имён: максимум времени, где ref-имя отображено на
-    # hyp-имя и интервалы одного и того же имени пересекаются в scored-области
+    # hyp-имя и интервалы одного и того же имени пересекаются в scored-области.
+    # Перебираются ВСЕ полные функции (для ≤3 спикеров — ≤ 9 вариантов): при
+    # путанице меток оптимальное отображение может быть неинъективным (оба
+    # эталонных имени показываются на одну гипотетскую метку) — перебор по
+    # перестановкам такое решение не рассматривает и занижает DER до 0.
+    # Ограничение matched <= covered гарантирует корректность confusion.
+    # Если гипотеза содержит только безымянную речь (UNKNOWN_SPEAKER) — имена не
+    # путались, просто диаризация не выполнялась: confusion = 0.
     ref_names = sorted({spk for _, _, spk in reference})
     hyp_names = sorted({spk for _, _, spk in hypothesis})
     import itertools
     matched = 0.0
-    if len(hyp_names) >= len(ref_names) and ref_names:
-        for perm in itertools.permutations(hyp_names, len(ref_names)):
-            mapping = dict(zip(ref_names, perm))
+    if hyp_names == [UNKNOWN_SPEAKER]:
+        matched = covered
+    elif len(hyp_names) >= len(ref_names) and ref_names:
+        ref_bounds = sorted({s for s, _, _ in reference} | {e for _, e, _ in reference})
+        hyp_bounds = sorted({s for s, _, _ in hypothesis} | {e for _, e, _ in hypothesis})
+        for mapping_tuple in itertools.product(hyp_names, repeat=len(ref_names)):
+            mapping = dict(zip(ref_names, mapping_tuple))
             t = 0.0
             for rname in ref_names:
                 rint = [(s, e) for s, e, nm in reference if nm == rname]
                 hint = [(s, e) for s, e, nm in hypothesis if nm == mapping[rname]]
-                # учитываем только scored-время с обеих сторон
-                rs = _merge(_intersect(_scored([(s, e, rname) for s, e, _ in [(a, b, rname) for a, b in rint]], collar),
-                                      [(s, e) for s, e in rint]))
-                hs = _merge(_intersect(_scored([(s, e, mapping[rname]) for s, e, _ in [(a, b, mapping[rname]) for a, b in hint]], collar),
-                                      [(s, e) for s, e in hint]))
-                t += _overlap(rs, hs)
+                rs = _merge(_intersect(rint, _scored_intervals(hint, hyp_bounds, collar)))
+                hs_ = _merge(_intersect(hint, _scored_intervals(rint, ref_bounds, collar)))
+                t += _overlap(rs, hs_)
             matched = max(matched, t)
-    confusion = max(0.0, covered - matched)
+    confusion = max(0.0, min(covered, covered - matched))
 
     errors = miss + fa + confusion
     return ErrorRate(errors / total_ref, round(errors, 3), round(total_ref, 3),
