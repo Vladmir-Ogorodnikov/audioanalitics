@@ -8,7 +8,7 @@ from audioanalytic.lexicon import (PROFANITY_MARKER, apply_censorship,
                                    build_initial_prompt, censor_text,
                                    load_badwords, load_terms, term_coverage)
 from audioanalytic.metrics import cer, der, normalize, wer
-from audioanalytic.models import Segment, Transcript
+from audioanalytic.models import UNKNOWN_SPEAKER, Segment, Transcript
 
 
 # --- lexicon -------------------------------------------------------------------
@@ -67,13 +67,16 @@ def test_wer_ignores_nbz():
 
 
 def test_cer_counts_chars():
+    # «мама» -> «рама»: одна замена символа (м->р), расстояние Левенштейна = 1
     c = cer("мама", "рама")
-    assert c.errors == 2
+    assert c.errors == 1 and abs(c.rate - 0.25) < 1e-9
 
 
 def test_der_perfect_match():
     ref = [(0.0, 1.0, "A"), (1.5, 3.0, "B")]
-    hyp = [(0.0, 1.0, "SPEAKER_0"), (1.5, 3.0, "SPEAKER_1")]
+    # гипотеза без диаризации: один безымянный спикер UNKNOWN_SPEAKER —
+    # имена не путались, ошибок confusion быть не должно
+    hyp = [(0.0, 1.0, UNKNOWN_SPEAKER), (1.5, 3.0, UNKNOWN_SPEAKER)]
     d = der(ref, hyp)
     assert d.rate == pytest.approx(0.0, abs=1e-6)
 

@@ -206,16 +206,18 @@ def _scored_intervals(intervals: list[tuple[float, float]],
 
 
 def der(reference: list[Interval], hypothesis: list[Interval],
-        collar: float = 0.25) -> ErrorRate:
-    """Упрощённый DER (как в pyannote, но с полным перебором имён спикеров —
-    при ≤ 3 спикеров это ≤ 6 перестановок):
-      miss        — эталонная речь (после collar), не покрытая ни одной гипотезой;
-      false alarm — гипотетическая речь (после collar), не покрытая эталоном;
-      confusion   — покрытое время, при котором имена спикеров не совпадают
-                    (берётся лучшее сопоставление имён, чтобы тривиальная
-                    путаница меток SPEAKER_0/1 не считалась ошибкой).
+        collar: float = 0.25, mapping: dict[str, str] | None = None) -> ErrorRate:
+    """DER по классической схеме md-eval.pl: доля времени речи эталона, где есть
+    пропуск (miss), ложное срабатывание (false alarm) или перепутанный спикер
+    (confusion).
+
+    mapping — соответствие имён «эталон -> гипотеза», которое проставляет
+    эксперт (или вызывающий код), когда подписи различаются («Алексей» против
+    SPEAKER_00). Без mapping имена сравниваются как есть: зеркальная путаница
+    A-B даст полный confusion, что и ожидается по смыслу DER.
+
     collar (сек) вырезается вокруг границ сегментов с обеих сторон — стандартная
-    практика pyannote: точность границ зависит от VAD, а не от диаризации.
+    практика pyannote: точность самих границ зависит от VAD, а не от диаризации.
     """
     ref_scored = _scored(reference, collar)
     hyp_scored = _scored(hypothesis, collar)
@@ -227,39 +229,58 @@ def der(reference: list[Interval], hypothesis: list[Interval],
     miss = max(0.0, total_ref - covered)
     fa = max(0.0, _total(hyp_scored) - covered)
 
-    # лучшее сопоставление имён: максимум времени, где ref-имя отображено на
-    # hyp-имя и интервалы одного и того же имени пересекаются в scored-области.
-    # Перебираются ВСЕ полные функции (для ≤3 спикеров — ≤ 9 вариантов): при
-    # путанице меток оптимальное отображение может быть неинъективным (оба
-    # эталонных имени показываются на одну гипотетскую метку) — перебор по
-    # перестановкам такое решение не рассматривает и занижает DER до 0.
-    # Ограничение matched <= covered гарантирует корректность confusion.
-    # Если гипотеза содержит только безымянную речь (UNKNOWN_SPEAKER) — имена не
-    # путались, просто диаризация не выполнялась: confusion = 0.
-    ref_names = sorted({spk for _, _, spk in reference})
-    hyp_names = sorted({spk for _, _, spk in hypothesis})
-    import itertools
-    matched = 0.0
-    if hyp_names == [UNKNOWN_SPEAKER]:
-        matched = covered
-    elif len(hyp_names) >= len(ref_names) and ref_names:
-        ref_bounds = sorted({s for s, _, _ in reference} | {e for _, e, _ in reference})
-        hyp_bounds = sorted({s for s, _, _ in hypothesis} | {e for _, e, _ in hypothesis})
-        for mapping_tuple in itertools.product(hyp_names, repeat=len(ref_names)):
-            mapping = dict(zip(ref_names, mapping_tuple))
-            t = 0.0
-            for rname in ref_names:
-                rint = [(s, e) for s, e, nm in reference if nm == rname]
-                hint = [(s, e) for s, e, nm in hypothesis if nm == mapping[rname]]
-                rs = _merge(_intersect(rint, _scored_intervals(hint, hyp_bounds, collar)))
-                hs_ = _merge(_intersect(hint, _scored_intervals(rint, ref_bounds, collar)))
-                t += _overlap(rs, hs_)
-            matched = max(matched, t)
-    confusion = max(0.0, min(covered, covered - matched))
+    # confusion: покрытое время, на котором набор имён спикера различается.
+    conf = min(_confusion_scored(reference, hypothesis, collar, mapping), covered)
 
-    errors = miss + fa + confusion
+    errors = miss + fa + conf
     return ErrorRate(errors / total_ref, round(errors, 3), round(total_ref, 3),
-                     round(confusion, 3), round(miss, 3), round(fa, 3))
+                     round(conf, 3), round(miss, 3), round(fa, 3))
+
+
+def _confusion_scored(reference: list[Interval], hypothesis: list[Interval],
+                      collar: float, mapping: dict[str, str] | None) -> float:
+    """Покадровая confusion в scored-области (защитные зоны ±collar исключены).
+
+    Для каждого кадра собираем множества имён из ref и из hyp; если оба
+    непустые и не равны — кадр засчитан как ошибка со весом
+    (|ref| - |ref ∩ hyp|) / |ref|, т.е. долей неверных имён среди эталонных.
+    Гипотеза без диаризации (единственное UNKNOWN_SPEAKER) ошибок имён не даёт:
+    имена не путались, просто диаризация не выполнялась.
+    """
+    hyp_names = {spk for _, _, spk in hypothesis}
+    if hyp_names == {UNKNOWN_SPEAKER}:
+        return 0.0
+    if mapping:
+        reference = [(s, e, mapping.get(nm, nm)) for s, e, nm in reference]
+
+    step = 0.01
+    lo = min([s for s, _, _ in reference] + [s for s, _, _ in hypothesis])
+    hi = max([e for _, e, _ in reference] + [e for _, e, _ in hypothesis])
+    n = int((hi - lo) / step) + 1
+    ref_map: list[set[str]] = [set() for _ in range(n)]
+    hyp_map: list[set[str]] = [set() for _ in range(n)]
+    for s, e, nm in reference:
+        for i in range(int((s - lo) / step), int((e - lo) / step)):
+            if 0 <= i < n:
+                ref_map[i].add(nm)
+    for s, e, nm in hypothesis:
+        for i in range(int((s - lo) / step), int((e - lo) / step)):
+            if 0 <= i < n:
+                hyp_map[i].add(nm)
+
+    bounds = sorted({s for s, _, _ in reference} | {e for _, e, _ in reference}
+                    | {s for s, _, _ in hypothesis} | {e for _, e, _ in hypothesis})
+    excl = [(b - collar, b + collar) for b in bounds]
+    conf = 0.0
+    for k, (rf, hf) in enumerate(zip(ref_map, hyp_map)):
+        if not rf or not hf or rf == hf:
+            continue
+        t = lo + (k + 0.5) * step
+        if any(a <= t < b for a, b in excl):
+            continue  # кадр в защитной зоне границы — не оцениваем
+        shared = rf & hf
+        conf += (len(rf) - len(shared)) / len(rf) * step
+    return conf
 
 
 def _intersect(a: list[tuple[float, float]], b: list[tuple[float, float]]) -> list[tuple[float, float]]:
