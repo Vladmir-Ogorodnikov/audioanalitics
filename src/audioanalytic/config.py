@@ -40,6 +40,12 @@ class SttConfig:
     max_speakers: int | None = None
     num_speakers: int | None = None
     hf_token: str | None = field(default_factory=lambda: os.environ.get("HF_TOKEN"))
+    # FR-02: предобработка аудио (16 кГц, моно, -16 LUFS) перед распознаванием
+    preprocess: bool = True
+    # FR-03: словарь терминов (initial prompt + оценка полноты) и файл плохих слов
+    terms_file: str | None = None
+    badwords_file: str | None = None
+    censor: bool = True  # маркировка [НБЗ]
 
     @classmethod
     def low_vram(cls, **kw) -> "SttConfig":
