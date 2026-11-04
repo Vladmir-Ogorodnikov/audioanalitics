@@ -109,10 +109,15 @@ pytest
 Формат строки: `[00:12:03] SPEAKER_01: текст реплики`.
 
 ## Как проверить, что всё работает
-1. `audioanalytic doctor` — все строки должны быть `[OK ]` (кроме HF_TOKEN, если диаризация не нужна).
-2. Логика без тяжёлых зависимостей: `pytest` (таймкоды, склейка реплик, нарезка частей, сериализация).
-3. Реальный прогон: короткий (1–2 мин) фрагмент лекции в `data\`, затем
+1. `audioanalytic doctor` — все строки должны быть `[OK ]`. Теперь doctor проверяет и **диаризацию**: установлен ли `pyannote.audio`, валиден ли `HF_TOKEN` и приняты ли условия модели (реальный запрос к huggingface.co; при 401/403 подскажет, что делать). Строка `torchcodec` informational — при сломанном декодере программа читает WAV сама.
+2. **Проверка полного цикла одной командой:**
+   ```bat
+   audioanalytic check data\lecture1.mp3 --cpu --speakers 1
+   ```
+   Прогоняет конвейер на первых 60 секундах файла (`--max-duration 120` — изменить, модель по умолчанию `small`) и печатает сводку: предобработка → ASR → выравнивание по словам → диаризация (спикеры SPEAKER_00/…) → чанки для LLM. В конце — «ПОЛНЫЙ ЦИКЛ РАБОТАЕТ ✓» или список проблем `[!!]`. Без GPU-весёлок можно проверить логику целиком офлайн: `python test_full_cycle.py data\lecture1.mp3` (whisperx подменяется заглушкой, реальные ffmpeg-проходы выполняются).
+3. Логика без тяжёлых зависимостей: `pytest` (таймкоды, склейка реплик, нарезка частей, сериализация).
+4. Реальный прогон: короткий (1–2 мин) фрагмент лекции в `data\`, затем
    `audioanalytic transcribe data\fragment.mp3 --no-diarize --model small`.
    Дождитесь `Сохранено в out\fragment` и откройте `out\fragment\transcript.txt` — строки вида `[00:00:12] текст`; `transcript.json` содержит сегменты и слова с таймкодами.
-4. Диаризация: повторите без `--no-diarize` с заданным `HF_TOKEN` — появятся `SPEAKER_00/SPEAKER_01`.
-5. Нарезка для LLM: `audioanalytic chunks out\fragment\transcript.json` → `out\fragment\llm_chunks\chunk_001.txt…`.
+5. Диаризация: повторите без `--no-diarize` с заданным `HF_TOKEN` — появятся `SPEAKER_00/SPEAKER_01` (или сразу `audioanalytic check ... --speakers N`).
+6. Нарезка для LLM: `audioanalytic chunks out\fragment\transcript.json` → `out\fragment\llm_chunks\chunk_001.txt…`.

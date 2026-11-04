@@ -46,6 +46,8 @@ class SttConfig:
     terms_file: str | None = None
     badwords_file: str | None = None
     censor: bool = True  # маркировка [НБЗ]
+    # Обработать только первые N секунд (0/None — весь файл). Для быстрых тестов.
+    max_duration: float | None = None
 
     @classmethod
     def low_vram(cls, **kw) -> "SttConfig":
