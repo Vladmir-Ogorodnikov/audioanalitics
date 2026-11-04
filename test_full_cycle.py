@@ -27,7 +27,8 @@ def make_fake_whisperx() -> types.ModuleType:
             "'...torchcodec\\\\libtorchcodec_core7.dll' (or one of its dependencies)")
 
     class _Model:
-        def transcribe(self, audio, batch_size=16, language=None, initial_prompt=None):
+        def transcribe(self, audio, batch_size=16, language=None):
+            # как в WhisperX без initial_prompt -> проверка отката в stt.py
             dur = audio.shape[-1] / 16000.0
             segs = []
             t = 0.0
