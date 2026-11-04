@@ -160,6 +160,12 @@ def transcribe(audio_path: str | Path, cfg: SttConfig | None = None,
         say("torchcodec не установлен корректно — встроенное декодирование "
             "будет заменено чтением WAV напрямую (через soundfile/ffmpeg)")
     audio = _load_audio(audio_path, exe, say)
+    # --max-duration: обработать только первые N секунд (быстрый тест всего цикла)
+    if cfg.max_duration:
+        n = int(float(cfg.max_duration) * 16_000)
+        if hasattr(audio, "shape") and audio.shape[-1] > n:
+            say(f"Обрезаю аудио до {cfg.max_duration:g} с (--max-duration)")
+            audio = audio[..., :n]
 
     say(f"Распознавание речи ({cfg.model}, {device}, {compute_type})")
     # FR-03: словарь терминов -> initial prompt Whisper (частично компенсирует

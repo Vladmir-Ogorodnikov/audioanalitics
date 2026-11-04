@@ -7,8 +7,8 @@ import sys
 from pathlib import Path
 
 from .config import SttConfig, load_dotenv
-from .formatting import chunk_for_llm, to_text
-from .models import Transcript
+from .formatting import build_turns, chunk_for_llm, to_text
+from .models import Transcript, UNKNOWN_SPEAKER
 from .winfix import (
     allow_pyannote_unpickling,
     check_ffmpeg,
@@ -46,6 +46,8 @@ def _cmd_transcribe(a: argparse.Namespace) -> int:
         cfg.model = a.model
     if getattr(a, "cpu", False):
         cfg.device = "cpu"
+    if getattr(a, "max_duration", None) is not None:
+        cfg.max_duration = float(a.max_duration)
     cfg.preprocess = not a.no_preprocess
     cfg.terms_file = a.terms
     cfg.badwords_file = a.badwords
@@ -100,8 +102,88 @@ def _cmd_evaluate(a: argparse.Namespace) -> int:
     return 0
 
 
+def _hf_get_json(url: str, token: str | None = None) -> tuple[int | None, dict | str]:
+    """GET c Bearer-токеном; возвращает (код, json|текст_ошибки).
+
+    Сетевые сбои/таймауты возвращают (None, ...) — это не считается провалом токена.
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    headers = {"User-Agent": "audioanalytic"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers),
+                                    timeout=15) as resp:
+            return getattr(resp, "status", 200), _json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        return e.code, str(e)
+    except Exception as e:  # нет сети / таймаут — не считаем ошибкой токена
+        return None, str(e)
+
+
+def _check_diarize(report) -> None:
+    """Диагностика диаризации: pyannote установлен, токен валиден, приняты условия.
+
+    Важно: обычный HEAD/gated-API репозитория pyannote отвечает 200 даже на мусорный
+    токен, поэтому валидность токена проверяем на /api/whoami-v2, а принятие условий —
+    на /gated c этим токеном (auto-gated модель отдаёт 401/403, пока вы не нажали
+    «Agree to access»).
+    """
+    tok = SttConfig().hf_token
+    if not tok:
+        report("диаризация", False,
+               "HF_TOKEN не задан — создайте .env из .env.example (или set HF_TOKEN=hf_...), "
+               "либо запускайте с --no-diarize")
+        return
+    try:
+        import pyannote.audio as pa  # noqa: F401
+        ver = getattr(pa, "__version__", None) or "?"
+        report("pyannote.audio", True, f"установлен {ver}")
+    except ImportError:
+        report("pyannote.audio", False,
+               "pip install -U pyannote.audio (диаризация через WhisperX требует его)")
+        return
+    except Exception as e:
+        report("pyannote.audio", False, f"импорт падает: {e}")
+        return
+
+    status, info = _hf_get_json("https://huggingface.co/api/whoami-v2", tok)
+    if status == 200 and isinstance(info, dict):
+        report("HF_TOKEN", True, f"валиден (аккаунт: {info.get('name', '?')})")
+        # модели pyannote gated («auto»): API отдаёт файлы только аккаунту,
+        # принявшему условия на странице модели — проверяем это тем же токеном
+        t_status, t_info = _hf_get_json(
+            "https://huggingface.co/api/models/pyannote/"
+            "speaker-diarization-community-1/tree/main", tok)
+        if t_status == 200:
+            report("доступ к pyannote", True,
+                   "условия модели приняты — диаризация готова")
+        elif t_status in (401, 403, 404):
+            report("доступ к pyannote", False,
+                   f"HTTP {t_status}: не приняты условия на "
+                   "https://huggingface.co/pyannote/speaker-diarization-community-1 "
+                   "(войдите аккаунтом этого токена и нажмите «Agree to access»)")
+        else:
+            report("доступ к pyannote", True,
+                   f"сеть недоступна ({t_info}) — пропускаем; при первом прогоне "
+                   "веса скачаются сами")
+    elif status in (401, 403):
+        report("HF_TOKEN", False,
+               "токен отклонён (HTTP 401/403) — проверьте значение HF_TOKEN "
+               "(без пробелов/кавычек) и что он активен на huggingface.co/settings/tokens")
+        return
+    else:
+        report("HF_TOKEN", True,
+               f"не удалось проверить онлайн ({info}) — пропускаем; если токен "
+               "некорректен, диаризация упадёт при первом прогоне")
+        return
+
+
 def _cmd_doctor(_a: argparse.Namespace) -> int:
-    """Проверка окружения: python, ffmpeg, torch/CUDA, whisperx, HF_TOKEN."""
+    """Проверка окружения: python, ffmpeg, torch/CUDA, whisperx, HF_TOKEN, диаризация."""
     import shutil
 
     ok = True
@@ -136,15 +218,114 @@ def _cmd_doctor(_a: argparse.Namespace) -> int:
     except ImportError:
         report("whisperx", False, "pip install -e .[dev] из папки проекта")
 
-    tok = SttConfig().hf_token
-    report("HF_TOKEN", tok is not None,
-            "задан" if tok else
-            "не задан — диаризация будет недоступна (.env / set HF_TOKEN=hf_...)")
+    _check_diarize(report)
+
+    # torchcodec: сломанный декодер torchaudio на Windows (мы умеем обходить,
+    # но пользователю полезно знать статус)
+    try:
+        import torchcodec.decoders  # noqa: F401
+        report("torchcodec", True, "установлен корректно")
+    except Exception as e:
+        report("torchcodec", True,
+               f"не грузится ({type(e).__name__}) — не страшно: подготовленный WAV "
+               "читается напрямую (soundfile/ffmpeg). Полное решение: pip install "
+               "torchcodec --index-url https://download.pytorch.org/whl/cpu")
 
     for name, good, note in disk_report_lines():
         report(name, good, note)
 
     print("Готов к работе" if ok else "Есть проблемы — см. строки с [!!]")
+    return 0 if ok else 1
+
+
+def _cmd_check(a: argparse.Namespace) -> int:
+    """Проверка полного цикла: предобработка -> ASR -> выравнивание -> диаризация -> чанки.
+
+    Прогоняет транскрипцию (по умолчанию только первые 60 секунд файла — быстрый
+    тест), затем проверяет: сегменты со словами и таймкодами, реальные спикеры
+    (не SPEAKER_??), наличие пауз между репликами и нарезку на части для LLM.
+    В конце печатает сводку [OK]/[!!] по каждому этапу.
+    """
+    src = Path(a.audio)
+    if not src.is_file():
+        print(f"Файл не найден: {src}", file=sys.stderr)
+        return 2
+
+    # 1) окружение (справочно: предупреждения не валят проверку — транскрипция ниже
+    #    сама покажет, что реально работает)
+    print("=== Шаг 1/3: проверка окружения ===")
+    _cmd_doctor(argparse.Namespace())
+    print()
+
+    # 2) прогон конвейера
+    print("=== Шаг 2/3: пробная транскрипция (полный цикл) ===")
+    targs = argparse.Namespace(audio=str(src), out=a.out, language="ru", model=a.model,
+                               low_vram=False, cpu=a.cpu, max_duration=a.max_duration,
+                               no_diarize=a.no_diarize, speakers=a.speakers,
+                               min_speakers=None, max_speakers=None, no_preprocess=False,
+                               terms=None, badwords=None, no_censor=False)
+    rc_t = _cmd_transcribe(targs)
+    print()
+
+    tr_path = Path(a.out) / src.stem / "transcript.json"
+    txt_path = tr_path.with_name("transcript.txt")
+    if rc_t != 0 or not tr_path.is_file():
+        print("[!!] Транскрипция не завершилась — полный цикл НЕ проходит "
+              f"(код возврата {rc_t}). См. сообщения выше.")
+        return 1
+
+    # 3) анализ результатов
+    print("=== Шаг 3/3: проверка результатов ===")
+    tr = Transcript.from_dict(json.loads(tr_path.read_text(encoding="utf-8")))
+    segs = tr.segments
+    ok = True
+
+    def report(name: str, good: bool, note: str = "") -> None:
+        nonlocal ok
+        if not good:
+            ok = False
+        print(f"[{'OK ' if good else '!! '}] {name}" + (f" — {note}" if note else ""))
+
+    dur = segs[-1].end if segs else 0.0
+    report("Сегменты", len(segs) > 0, f"{len(segs)} сегм., длительность ~{dur:.0f} с")
+    n_words = sum(len(s.words) for s in segs)
+    timed = all(w.start is not None and w.end is not None
+                for s in segs for w in s.words)
+    report("Выравнивание по словам", n_words > 0 and timed,
+           f"{n_words} слов с таймкодами")
+
+    turns = build_turns(tr)
+    report("Реплики (склеивание сегментов)", len(turns) >= 1,
+           f"{len(turns)} реплик из {len(segs)} сегментов")
+    gaps = [round(t.start - prev.end, 2) for prev, t in zip(turns, turns[1:])
+            if t.start - prev.end > 0.5]
+    print(f"[-- ] Паузы между репликами — {len(gaps)} пауз >0.5 c"
+          + (f" (например {gaps[:5]})" if gaps else ""))
+
+    if a.no_diarize:
+        print("[-- ] Диаризация пропущена (--no-diarize)")
+    else:
+        spk = sorted({s.speaker for s in segs if s.speaker and s.speaker != UNKNOWN_SPEAKER})
+        unknown = sum(1 for s in segs if s.speaker == UNKNOWN_SPEAKER)
+        report("Диаризация", len(spk) >= 1,
+               f"спикеры: {', '.join(spk)}; сегментов без спикера: {unknown}/{len(segs)}"
+               + ("" if len(spk) >= 2 else " (один спикер — возможно, так и есть, или диаризация не сработала)"))
+
+    parts = chunk_for_llm(tr, max_chars=a.max_chars)
+    total = sum(len(p) for p in parts)
+    joined = "\n".join(parts)
+    intact = all(seg.text.strip() in joined for seg in segs if seg.text.strip())
+    report("Чанки для LLM", len(parts) >= 1 and intact,
+           f"{len(parts)} част.(макс {max((len(p) for p in parts), default=0)} симв., "
+           f"всего {total}); тексты сегментов целые: {'да' if intact else 'НЕТ'}")
+
+    print()
+    print(f"Файлы: {tr_path}, {txt_path}")
+    if ok:
+        print("ПОЛНЫЙ ЦИКЛ РАБОТАЕТ ✓ (предобработка → ASR → выравнивание → "
+              "диаризация → чанки)")
+    else:
+        print("Есть проблемы — см. строки с [!!]")
     return 0 if ok else 1
 
 
@@ -161,6 +342,8 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--model", help="например large-v3, large-v3-turbo")
     t.add_argument("--low-vram", action="store_true", help="профиль для GPU 8 ГБ")
     t.add_argument("--cpu", action="store_true", help="принудительно CPU (без CUDA)")
+    t.add_argument("--max-duration", type=float, metavar="SEC",
+                   help="обработать только первые SEC секунд (быстрый тест полного цикла)")
     t.add_argument("--no-diarize", action="store_true")
     t.add_argument("--speakers", type=int, help="точное число спикеров")
     t.add_argument("--min-speakers", type=int)
@@ -177,8 +360,22 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--max-chars", type=int, default=12000)
     c.set_defaults(fn=_cmd_chunks)
 
-    d = sub.add_parser("doctor", help="проверка окружения (ffmpeg, CUDA, whisperx, HF_TOKEN)")
+    d = sub.add_parser("doctor", help="проверка окружения (ffmpeg, CUDA, whisperx, HF_TOKEN, диаризация)")
     d.set_defaults(fn=_cmd_doctor)
+
+    c2 = sub.add_parser("check", help="проверка ПОЛНОГО ЦИКЛА на коротком фрагменте: "
+                                      "предобработка → ASR → выравнивание → диаризация → чанки")
+    c2.add_argument("audio")
+    c2.add_argument("--out", default="out_check")
+    c2.add_argument("--model", default="small",
+                    help="модель для пробного прогона (по умолчанию small — быстрее)")
+    c2.add_argument("--cpu", action="store_true", help="принудительно CPU")
+    c2.add_argument("--max-duration", type=float, default=60.0, metavar="SEC",
+                    help="сколько секунд файла обработать (по умолчанию 60; 0 — весь файл)")
+    c2.add_argument("--no-diarize", action="store_true")
+    c2.add_argument("--speakers", type=int, help="точное число спикеров (для диаризации)")
+    c2.add_argument("--max-chars", type=int, default=12000, help="лимит символов в чанке")
+    c2.set_defaults(fn=_cmd_check)
 
     e = sub.add_parser("evaluate", help="WER/CER транскрипта против эталона (NFR-01)")
     e.add_argument("transcript", help="out/.../transcript.json")
