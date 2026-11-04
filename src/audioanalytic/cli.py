@@ -102,21 +102,22 @@ def _cmd_evaluate(a: argparse.Namespace) -> int:
     return 0
 
 
-def _hf_head(token: str) -> tuple[int | None, str]:
-    """HEAD-запрос к gated-репозиторию pyannote с Bearer-токеном.
+def _hf_get_json(url: str, token: str | None = None) -> tuple[int | None, dict | str]:
+    """GET c Bearer-токеном; возвращает (код, json|текст_ошибки).
 
-    Возвращает (код_ответа, текст_ошибки). Сетевые сбои возвращают (None, ...)
-    — это не считается провалом токена.
+    Сетевые сбои/таймауты возвращают (None, ...) — это не считается провалом токена.
     """
+    import json as _json
     import urllib.error
     import urllib.request
 
-    url = ("https://huggingface.co/api/models/pyannote/"
-           "speaker-diarization-community-1")
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    headers = {"User-Agent": "audioanalytic"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return getattr(resp, "status", 200), ""
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers),
+                                    timeout=15) as resp:
+            return getattr(resp, "status", 200), _json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         return e.code, str(e)
     except Exception as e:  # нет сети / таймаут — не считаем ошибкой токена
@@ -124,7 +125,13 @@ def _hf_head(token: str) -> tuple[int | None, str]:
 
 
 def _check_diarize(report) -> None:
-    """Диагностика диаризации: pyannote установлен, токен валиден, приняты условия."""
+    """Диагностика диаризации: pyannote установлен, токен валиден, приняты условия.
+
+    Важно: обычный HEAD/gated-API репозитория pyannote отвечает 200 даже на мусорный
+    токен, поэтому валидность токена проверяем на /api/whoami-v2, а принятие условий —
+    на /gated c этим токеном (auto-gated модель отдаёт 401/403, пока вы не нажали
+    «Agree to access»).
+    """
     tok = SttConfig().hf_token
     if not tok:
         report("диаризация", False,
@@ -142,19 +149,37 @@ def _check_diarize(report) -> None:
     except Exception as e:
         report("pyannote.audio", False, f"импорт падает: {e}")
         return
-    status, err = _hf_head(tok)
-    if status == 200:
-        report("HF_TOKEN + доступ к pyannote", True,
-               "токен принят, условия модели доступны — диаризация готова")
+
+    status, info = _hf_get_json("https://huggingface.co/api/whoami-v2", tok)
+    if status == 200 and isinstance(info, dict):
+        report("HF_TOKEN", True, f"валиден (аккаунт: {info.get('name', '?')})")
+        # модели pyannote gated («auto»): API отдаёт файлы только аккаунту,
+        # принявшему условия на странице модели — проверяем это тем же токеном
+        t_status, t_info = _hf_get_json(
+            "https://huggingface.co/api/models/pyannote/"
+            "speaker-diarization-community-1/tree/main", tok)
+        if t_status == 200:
+            report("доступ к pyannote", True,
+                   "условия модели приняты — диаризация готова")
+        elif t_status in (401, 403, 404):
+            report("доступ к pyannote", False,
+                   f"HTTP {t_status}: не приняты условия на "
+                   "https://huggingface.co/pyannote/speaker-diarization-community-1 "
+                   "(войдите аккаунтом этого токена и нажмите «Agree to access»)")
+        else:
+            report("доступ к pyannote", True,
+                   f"сеть недоступна ({t_info}) — пропускаем; при первом прогоне "
+                   "веса скачаются сами")
     elif status in (401, 403):
-        report("HF_TOKEN + доступ к pyannote", False,
-               f"HTTP {status}: токен недействителен ИЛИ не приняты условия на "
-               "https://huggingface.co/pyannote/speaker-diarization-community-1 "
-               "(кнопка «Agree to terms») — см. README, раздел про токен")
+        report("HF_TOKEN", False,
+               "токен отклонён (HTTP 401/403) — проверьте значение HF_TOKEN "
+               "(без пробелов/кавычек) и что он активен на huggingface.co/settings/tokens")
+        return
     else:
-        report("проверка доступа к pyannote", True,
-               f"сеть недоступна ({err}) — пропускаем; при первом прогоне веса "
-               "скачаются сами")
+        report("HF_TOKEN", True,
+               f"не удалось проверить онлайн ({info}) — пропускаем; если токен "
+               "некорректен, диаризация упадёт при первом прогоне")
+        return
 
 
 def _cmd_doctor(_a: argparse.Namespace) -> int:
