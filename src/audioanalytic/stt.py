@@ -50,6 +50,75 @@ def _to_transcript(result: dict, language: str, source: str) -> Transcript:
     return Transcript(language=language, segments=segments, source=source)
 
 
+def _torchcodec_ok() -> bool:
+    """True, если встроенный декодер whisperx (torchaudio/torchcodec) рабочий.
+
+    На Windows torchcodec часто не устанавливается корректно (не грузятся
+    libtorchcodec_core*.dll) — тогда load_audio падает уже ПОСЛЕ нашей
+    предобработки, и весь прогон идёт насмарку. Проверяем это заранее.
+    """
+    try:
+        import torchcodec.decoders  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _load_audio_fallback(audio_path: str, sr: int = 16_000):
+    """Читает WAV в обход torchcodec через soundfile (или stdlib wave)."""
+    try:
+        import numpy as np
+        import soundfile as sf
+        import torch
+        data, rate = sf.read(audio_path, dtype="float32", always_2d=True)
+        if data.shape[1] > 1:  # даунмикс в моно
+            data = data.mean(axis=1, keepdims=True)
+        if rate != sr:
+            # редкий случай: пересэмплируем «наивно» нельзя — просим ffmpeg
+            raise RuntimeError(f"sample rate {rate} != {sr}")
+        return torch.from_numpy(np.ascontiguousarray(data.T))  # (channel, time)
+    except ImportError:
+        pass
+    # совсем лёгкий путь без зависимостей: 16-битный моно WAV читаем модулем wave
+    import array
+    import torch
+    import wave
+    with wave.open(audio_path, "rb") as w:
+        n = w.getnframes()
+        raw = w.readframes(n)
+        data = array.array("h", raw)
+        mono = [s / 32768.0 for s in data]
+        return torch.tensor(mono, dtype=torch.float32).unsqueeze(0)
+
+
+def _load_audio(audio_path: str, ffmpeg_file: str | None,
+                say: Progress | None = None) -> object:
+    """Загружает аудио для WhisperX; при сломанном torchcodec читает WAV сам."""
+    import whisperx
+
+    kwargs = {}
+    if ffmpeg_file and "ffmpeg_file" in _load_audio_kwargs_names():
+        kwargs["ffmpeg_file"] = ffmpeg_file
+    try:
+        return whisperx.load_audio(audio_path, **kwargs)
+    except Exception as e:
+        msg = str(e).lower()
+        if "torchcodec" not in msg and "libtorchcodec" not in msg:
+            raise
+        if say:
+            say("torchcodec не работает — читаю подготовленный WAV напрямую")
+        return _load_audio_fallback(audio_path)
+
+
+def _load_audio_kwargs_names() -> set[str]:
+    import inspect
+    import whisperx
+    try:
+        return set(inspect.signature(whisperx.load_audio).parameters)
+    except (TypeError, ValueError):
+        return set()
+
+
 def transcribe(audio_path: str | Path, cfg: SttConfig | None = None,
                progress: Progress | None = None) -> Transcript:
     cfg = cfg or SttConfig()
@@ -81,17 +150,16 @@ def transcribe(audio_path: str | Path, cfg: SttConfig | None = None,
     # HF_HUB_ENABLE_HF_TRANSFER=1 на Windows часто обрывает скачивание весов -> отключаем
     os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
     # ffmpeg может быть не в PATH, но найден в папках winget — подставим путь явно
-    kwargs = {}
+    exe = None
     try:
-        import inspect
-        if "ffmpeg_file" in inspect.signature(whisperx.load_audio).parameters:
-            from .winfix import find_ffmpeg
-            exe = find_ffmpeg()
-            if exe:
-                kwargs["ffmpeg_file"] = exe
+        from .winfix import find_ffmpeg
+        exe = find_ffmpeg()
     except Exception:
         pass
-    audio = whisperx.load_audio(audio_path, **kwargs)
+    if not _torchcodec_ok():
+        say("torchcodec не установлен корректно — встроенное декодирование "
+            "будет заменено чтением WAV напрямую (через soundfile/ffmpeg)")
+    audio = _load_audio(audio_path, exe, say)
 
     say(f"Распознавание речи ({cfg.model}, {device}, {compute_type})")
     # FR-03: словарь терминов -> initial prompt Whisper (частично компенсирует
