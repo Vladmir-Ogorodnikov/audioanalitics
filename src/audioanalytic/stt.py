@@ -178,8 +178,27 @@ def transcribe(audio_path: str | Path, cfg: SttConfig | None = None,
         say(f"Словарь терминов: {len(terms)} слов, initial prompt задан")
 
     model = whisperx.load_model(cfg.model, device, compute_type=compute_type, language=cfg.language)
-    result = model.transcribe(audio, batch_size=cfg.batch_size, language=cfg.language,
-                              initial_prompt=initial_prompt)
+    tr_kwargs = dict(batch_size=cfg.batch_size, language=cfg.language)
+    if initial_prompt:
+        tr_kwargs["initial_prompt"] = initial_prompt
+
+    def _is_prompt_error(e: TypeError) -> bool:
+        s = str(e).lower()
+        return "initial_prompt" in s or "decodeoptions" in s
+
+    try:
+        result = model.transcribe(audio, **tr_kwargs)
+    except TypeError as e:
+        # Совместимость: у FasterWhisperPipeline.transcribe() в ряде версий WhisperX нет
+        # параметра initial_prompt (он уходит в **model_kwargs -> DecodeOptions и вызывает
+        # TypeError). Убираем подсказку и повторяем — термины применятся постобработкой.
+        if initial_prompt and _is_prompt_error(e):
+            say("Эта версия WhisperX не поддерживает initial_prompt — "
+                "словарь терминов будет применён постобработкой (замена опечаток)")
+            tr_kwargs.pop("initial_prompt", None)
+            result = model.transcribe(audio, **tr_kwargs)
+        else:
+            raise
     del model
     _free_memory()
 
