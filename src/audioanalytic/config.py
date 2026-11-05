@@ -48,6 +48,9 @@ class SttConfig:
     censor: bool = True  # маркировка [НБЗ]
     # Обработать только первые N секунд (0/None — весь файл). Для быстрых тестов.
     max_duration: float | None = None
+    # Последовательная обработка длинных записей кусками по N секунд (0 — без разбивки).
+    # Спасает от OOM (mkl_malloc) на CPU при 60-минутных записях и крупных моделях.
+    chunk_duration: float = 300.0
 
     @classmethod
     def low_vram(cls, **kw) -> "SttConfig":
