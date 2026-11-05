@@ -50,29 +50,51 @@ def normalize_loudness(src: Path, dst: Path, *, ffmpeg: str = "ffmpeg") -> Path:
     except Exception:
         # однопроходная нормализация как запасной вариант
         _run(base_cmd + ["-af", filters.replace(":print_format=json", ""),
-                         "-ar", str(SAMPLE_RATE), "-ac", "1",
+                         "-vn", "-ar", str(SAMPLE_RATE), "-ac", "1",
                          "-c:a", "pcm_s16le", str(dst)])
         return dst
 
     m = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", stderr)
     if not m:
         _run(base_cmd + ["-af", filters.replace(":print_format=json", ""),
-                         "-ar", str(SAMPLE_RATE), "-ac", "1",
+                         "-vn", "-ar", str(SAMPLE_RATE), "-ac", "1",
                          "-c:a", "pcm_s16le", str(dst)])
         return dst
     meas = json.loads(m.group(0))
-    if float(meas.get("input_i", 0)) <= -70.0:  # практически тишина
-        meas["target_low"] = None  # не мешаем loudnorm работать «в лоб»
 
+    def _f(key: str, default: float) -> float:
+        """Безопасное число из JSON loudnorm (иногда значения вида 'inf'/'-inf')."""
+        try:
+            v = float(meas.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        if v != v or v in (float("inf"), float("-inf")):  # NaN/±inf
+            return default
+        return v
+
+    input_i = _f("input_i", 0.0)
+    if input_i <= -70.0:  # практически тишина — измерения недостоверны,
+        # нормализуем в один проход («в лоб»), чтобы linear-режим не сломался
+        _run(base_cmd + ["-af", filters.replace(":print_format=json", ""),
+                         "-vn", "-ar", str(SAMPLE_RATE), "-ac", "1",
+                         "-c:a", "pcm_s16le", str(dst)])
+        return dst
+
+    # ВАЖНО: имена параметров второго прохода — measured_I / measured_TP /
+    # measured_LRA / measured_thresh (именно так их принимает фильтр loudnorm).
+    # Варианты вида measured_input_i ffmpeg не знает и падает с «Option not found».
     second = (
         f"loudnorm=I={TARGET_LUFS}:TP={TARGET_TP}:LRA={TARGET_LRA}"
-        f":measured_input_i={meas['input_i']}"
-        f":measured_input_tp={meas['input_tp']}"
-        f":measured_input_lra={meas['input_lra']}"
-        f":measured_input_thresh={meas['input_thresh']}"
-        f":linear=true:measured_target_lra={meas.get('target_lra', TARGET_LRA)}"
+        f":measured_I={input_i:.2f}"
+        f":measured_TP={_f('input_tp', -1.5):.2f}"
+        f":measured_LRA={_f('input_lra', TARGET_LRA):.2f}"
+        f":measured_thresh={_f('input_thresh', -70.0):.2f}"
+        ":linear=true"
+        f":offset={_f('target_offset', 0.0):.2f}"
     )
-    _run(base_cmd + ["-af", second, "-ar", str(SAMPLE_RATE), "-ac", "1",
+    # -vn: в mp3 часто есть прикреплённая обложка (attached pic) — без -vn она
+    # мешает кодированию выходного WAV
+    _run(base_cmd + ["-af", second, "-vn", "-ar", str(SAMPLE_RATE), "-ac", "1",
                      "-c:a", "pcm_s16le", str(dst)])
     return dst
 

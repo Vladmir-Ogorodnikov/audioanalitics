@@ -50,6 +50,75 @@ def _to_transcript(result: dict, language: str, source: str) -> Transcript:
     return Transcript(language=language, segments=segments, source=source)
 
 
+def _torchcodec_ok() -> bool:
+    """True, если встроенный декодер whisperx (torchaudio/torchcodec) рабочий.
+
+    На Windows torchcodec часто не устанавливается корректно (не грузятся
+    libtorchcodec_core*.dll) — тогда load_audio падает уже ПОСЛЕ нашей
+    предобработки, и весь прогон идёт насмарку. Проверяем это заранее.
+    """
+    try:
+        import torchcodec.decoders  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _load_audio_fallback(audio_path: str, sr: int = 16_000):
+    """Читает WAV в обход torchcodec через soundfile (или stdlib wave)."""
+    try:
+        import numpy as np
+        import soundfile as sf
+        import torch
+        data, rate = sf.read(audio_path, dtype="float32", always_2d=True)
+        if data.shape[1] > 1:  # даунмикс в моно
+            data = data.mean(axis=1, keepdims=True)
+        if rate != sr:
+            # редкий случай: пересэмплируем «наивно» нельзя — просим ffmpeg
+            raise RuntimeError(f"sample rate {rate} != {sr}")
+        return torch.from_numpy(np.ascontiguousarray(data.T))  # (channel, time)
+    except ImportError:
+        pass
+    # совсем лёгкий путь без зависимостей: 16-битный моно WAV читаем модулем wave
+    import array
+    import torch
+    import wave
+    with wave.open(audio_path, "rb") as w:
+        n = w.getnframes()
+        raw = w.readframes(n)
+        data = array.array("h", raw)
+        mono = [s / 32768.0 for s in data]
+        return torch.tensor(mono, dtype=torch.float32).unsqueeze(0)
+
+
+def _load_audio(audio_path: str, ffmpeg_file: str | None,
+                say: Progress | None = None) -> object:
+    """Загружает аудио для WhisperX; при сломанном torchcodec читает WAV сам."""
+    import whisperx
+
+    kwargs = {}
+    if ffmpeg_file and "ffmpeg_file" in _load_audio_kwargs_names():
+        kwargs["ffmpeg_file"] = ffmpeg_file
+    try:
+        return whisperx.load_audio(audio_path, **kwargs)
+    except Exception as e:
+        msg = str(e).lower()
+        if "torchcodec" not in msg and "libtorchcodec" not in msg:
+            raise
+        if say:
+            say("torchcodec не работает — читаю подготовленный WAV напрямую")
+        return _load_audio_fallback(audio_path)
+
+
+def _load_audio_kwargs_names() -> set[str]:
+    import inspect
+    import whisperx
+    try:
+        return set(inspect.signature(whisperx.load_audio).parameters)
+    except (TypeError, ValueError):
+        return set()
+
+
 def transcribe(audio_path: str | Path, cfg: SttConfig | None = None,
                progress: Progress | None = None) -> Transcript:
     cfg = cfg or SttConfig()
@@ -81,17 +150,22 @@ def transcribe(audio_path: str | Path, cfg: SttConfig | None = None,
     # HF_HUB_ENABLE_HF_TRANSFER=1 на Windows часто обрывает скачивание весов -> отключаем
     os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
     # ffmpeg может быть не в PATH, но найден в папках winget — подставим путь явно
-    kwargs = {}
+    exe = None
     try:
-        import inspect
-        if "ffmpeg_file" in inspect.signature(whisperx.load_audio).parameters:
-            from .winfix import find_ffmpeg
-            exe = find_ffmpeg()
-            if exe:
-                kwargs["ffmpeg_file"] = exe
+        from .winfix import find_ffmpeg
+        exe = find_ffmpeg()
     except Exception:
         pass
-    audio = whisperx.load_audio(audio_path, **kwargs)
+    if not _torchcodec_ok():
+        say("torchcodec не установлен корректно — встроенное декодирование "
+            "будет заменено чтением WAV напрямую (через soundfile/ffmpeg)")
+    audio = _load_audio(audio_path, exe, say)
+    # --max-duration: обработать только первые N секунд (быстрый тест всего цикла)
+    if cfg.max_duration:
+        n = int(float(cfg.max_duration) * 16_000)
+        if hasattr(audio, "shape") and audio.shape[-1] > n:
+            say(f"Обрезаю аудио до {cfg.max_duration:g} с (--max-duration)")
+            audio = audio[..., :n]
 
     say(f"Распознавание речи ({cfg.model}, {device}, {compute_type})")
     # FR-03: словарь терминов -> initial prompt Whisper (частично компенсирует
@@ -104,8 +178,59 @@ def transcribe(audio_path: str | Path, cfg: SttConfig | None = None,
         say(f"Словарь терминов: {len(terms)} слов, initial prompt задан")
 
     model = whisperx.load_model(cfg.model, device, compute_type=compute_type, language=cfg.language)
-    result = model.transcribe(audio, batch_size=cfg.batch_size, language=cfg.language,
-                              initial_prompt=initial_prompt)
+    tr_kwargs = dict(batch_size=cfg.batch_size, language=cfg.language)
+    if initial_prompt:
+        tr_kwargs["initial_prompt"] = initial_prompt
+
+    def _is_prompt_error(e: TypeError) -> bool:
+        s = str(e).lower()
+        return "initial_prompt" in s or "decodeoptions" in s
+
+    def _run_asr(aud):
+        try:
+            return model.transcribe(aud, **tr_kwargs)
+        except TypeError as e:
+            # Совместимость: у FasterWhisperPipeline.transcribe() в ряде версий WhisperX нет
+            # параметра initial_prompt (он уходит в **model_kwargs -> DecodeOptions и вызывает
+            # TypeError). Убираем подсказку и повторяем — термины применятся постобработкой.
+            if initial_prompt and _is_prompt_error(e):
+                say("Эта версия WhisperX не поддерживает initial_prompt — "
+                    "словарь терминов будет применён постобработкой (замена опечаток)")
+                tr_kwargs.pop("initial_prompt", None)
+                return model.transcribe(aud, **tr_kwargs)
+            raise
+
+    try:
+        duration = float(audio.shape[-1]) / 16_000
+    except Exception:
+        duration = 0.0
+    step = float(getattr(cfg, "chunk_duration", 0) or 0)
+    if step > 0 and duration > step:
+        # Последовательная обработка длинных записей кусками: при 60 мин и large-v3
+        # на CPU весь файл разом вызывает OOM ("mkl_malloc: failed to allocate memory").
+        n_chunks = int(-(-duration // step))
+        say(f"Обработка частями по {step:g} с (всего частей: {n_chunks}, длительность ~{duration/60:.1f} мин)")
+        all_segments = []
+        for i in range(n_chunks):
+            off = i * step
+            piece = audio[..., int(off * 16_000):int(min(off + step, duration) * 16_000)]
+            part = _run_asr(piece)
+            for s in part["segments"]:
+                s = dict(s)
+                s["start"] = float(s.get("start", 0)) + off
+                s["end"] = float(s.get("end", 0)) + off
+                for w in s.get("words", []):
+                    if w.get("start") is not None:
+                        w["start"] = float(w["start"]) + off
+                    if w.get("end") is not None:
+                        w["end"] = float(w["end"]) + off
+                all_segments.append(s)
+            say(f"  Часть {i + 1}/{n_chunks}: сегментов {len(part['segments'])}")
+            del part, piece
+            _free_memory()
+        result = {"segments": all_segments, "language": cfg.language}
+    else:
+        result = _run_asr(audio)
     del model
     _free_memory()
 
@@ -124,8 +249,47 @@ def transcribe(audio_path: str | Path, cfg: SttConfig | None = None,
                 "в Параметры -> Язык и регион -> Административные параметры языка."
             ) from e
         raise
-    result = whisperx.align(result["segments"], align_model, meta, audio, device,
-                            return_char_alignments=False)
+    align_step = step if (step > 0 and duration > step) else float("inf")
+    if align_step != float("inf"):
+        say(f"Выравнивание по словам частями по {step:g} с")
+    # Границы кусков: если выравниватель вернул сегмент целиком в предыдущий/следующий
+    # кусок — относим его к куску, где у него бо́льшая часть длительности.
+    def _chunk_of(s):
+        mid = (float(s["start"]) + float(s["end"])) / 2.0
+        return int(mid // align_step) if align_step != float("inf") else 0
+    n_align_chunks = int(-(-duration // align_step)) if align_step != float("inf") else 1
+    aligned_segments = []
+    for i in range(max(n_align_chunks, 1)):
+        off = min(i * align_step, duration)
+        hi = min(off + align_step, duration)
+        if not (hi > off):  # защита от NaN/пустого куска
+            break
+        piece = audio[..., int(off * 16_000):int(hi * 16_000)]
+        part_segs = [dict(s) for s in result["segments"] if _chunk_of(s) == i]
+        for s in part_segs:
+            s["start"] = float(s["start"]) - off
+            s["end"] = max(float(s["end"]) - off, 0.0)
+            for w in s.get("words", []):
+                if w.get("start") is not None:
+                    w["start"] = float(w["start"]) - off
+                if w.get("end") is not None:
+                    w["end"] = float(w["end"]) - off
+        if part_segs:
+            aligned_part = whisperx.align(part_segs, align_model, meta, piece, device,
+                                          return_char_alignments=False)
+            for s in aligned_part["segments"]:
+                s = dict(s)
+                s["start"] = float(s.get("start", 0)) + off
+                s["end"] = float(s.get("end", 0)) + off
+                for w in s.get("words", []):
+                    if w.get("start") is not None:
+                        w["start"] = float(w["start"]) + off
+                    if w.get("end") is not None:
+                        w["end"] = float(w["end"]) + off
+                aligned_segments.append(s)
+        del piece, part_segs
+        _free_memory()
+    result["segments"] = sorted(aligned_segments, key=lambda s: s["start"])
     del align_model
     _free_memory()
 
