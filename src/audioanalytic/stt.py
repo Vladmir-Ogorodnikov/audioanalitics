@@ -186,19 +186,51 @@ def transcribe(audio_path: str | Path, cfg: SttConfig | None = None,
         s = str(e).lower()
         return "initial_prompt" in s or "decodeoptions" in s
 
-    try:
-        result = model.transcribe(audio, **tr_kwargs)
-    except TypeError as e:
-        # Совместимость: у FasterWhisperPipeline.transcribe() в ряде версий WhisperX нет
-        # параметра initial_prompt (он уходит в **model_kwargs -> DecodeOptions и вызывает
-        # TypeError). Убираем подсказку и повторяем — термины применятся постобработкой.
-        if initial_prompt and _is_prompt_error(e):
-            say("Эта версия WhisperX не поддерживает initial_prompt — "
-                "словарь терминов будет применён постобработкой (замена опечаток)")
-            tr_kwargs.pop("initial_prompt", None)
-            result = model.transcribe(audio, **tr_kwargs)
-        else:
+    def _run_asr(aud):
+        try:
+            return model.transcribe(aud, **tr_kwargs)
+        except TypeError as e:
+            # Совместимость: у FasterWhisperPipeline.transcribe() в ряде версий WhisperX нет
+            # параметра initial_prompt (он уходит в **model_kwargs -> DecodeOptions и вызывает
+            # TypeError). Убираем подсказку и повторяем — термины применятся постобработкой.
+            if initial_prompt and _is_prompt_error(e):
+                say("Эта версия WhisperX не поддерживает initial_prompt — "
+                    "словарь терминов будет применён постобработкой (замена опечаток)")
+                tr_kwargs.pop("initial_prompt", None)
+                return model.transcribe(aud, **tr_kwargs)
             raise
+
+    try:
+        duration = float(audio.shape[-1]) / 16_000
+    except Exception:
+        duration = 0.0
+    step = float(getattr(cfg, "chunk_duration", 0) or 0)
+    if step > 0 and duration > step:
+        # Последовательная обработка длинных записей кусками: при 60 мин и large-v3
+        # на CPU весь файл разом вызывает OOM ("mkl_malloc: failed to allocate memory").
+        n_chunks = int(-(-duration // step))
+        say(f"Обработка частями по {step:g} с (всего частей: {n_chunks}, длительность ~{duration/60:.1f} мин)")
+        all_segments = []
+        for i in range(n_chunks):
+            off = i * step
+            piece = audio[..., int(off * 16_000):int(min(off + step, duration) * 16_000)]
+            part = _run_asr(piece)
+            for s in part["segments"]:
+                s = dict(s)
+                s["start"] = float(s.get("start", 0)) + off
+                s["end"] = float(s.get("end", 0)) + off
+                for w in s.get("words", []):
+                    if w.get("start") is not None:
+                        w["start"] = float(w["start"]) + off
+                    if w.get("end") is not None:
+                        w["end"] = float(w["end"]) + off
+                all_segments.append(s)
+            say(f"  Часть {i + 1}/{n_chunks}: сегментов {len(part['segments'])}")
+            del part, piece
+            _free_memory()
+        result = {"segments": all_segments, "language": cfg.language}
+    else:
+        result = _run_asr(audio)
     del model
     _free_memory()
 
@@ -217,8 +249,47 @@ def transcribe(audio_path: str | Path, cfg: SttConfig | None = None,
                 "в Параметры -> Язык и регион -> Административные параметры языка."
             ) from e
         raise
-    result = whisperx.align(result["segments"], align_model, meta, audio, device,
-                            return_char_alignments=False)
+    align_step = step if (step > 0 and duration > step) else float("inf")
+    if align_step != float("inf"):
+        say(f"Выравнивание по словам частями по {step:g} с")
+    # Границы кусков: если выравниватель вернул сегмент целиком в предыдущий/следующий
+    # кусок — относим его к куску, где у него бо́льшая часть длительности.
+    def _chunk_of(s):
+        mid = (float(s["start"]) + float(s["end"])) / 2.0
+        return int(mid // align_step) if align_step != float("inf") else 0
+    n_align_chunks = int(-(-duration // align_step)) if align_step != float("inf") else 1
+    aligned_segments = []
+    for i in range(max(n_align_chunks, 1)):
+        off = min(i * align_step, duration)
+        hi = min(off + align_step, duration)
+        if not (hi > off):  # защита от NaN/пустого куска
+            break
+        piece = audio[..., int(off * 16_000):int(hi * 16_000)]
+        part_segs = [dict(s) for s in result["segments"] if _chunk_of(s) == i]
+        for s in part_segs:
+            s["start"] = float(s["start"]) - off
+            s["end"] = max(float(s["end"]) - off, 0.0)
+            for w in s.get("words", []):
+                if w.get("start") is not None:
+                    w["start"] = float(w["start"]) - off
+                if w.get("end") is not None:
+                    w["end"] = float(w["end"]) - off
+        if part_segs:
+            aligned_part = whisperx.align(part_segs, align_model, meta, piece, device,
+                                          return_char_alignments=False)
+            for s in aligned_part["segments"]:
+                s = dict(s)
+                s["start"] = float(s.get("start", 0)) + off
+                s["end"] = float(s.get("end", 0)) + off
+                for w in s.get("words", []):
+                    if w.get("start") is not None:
+                        w["start"] = float(w["start"]) + off
+                    if w.get("end") is not None:
+                        w["end"] = float(w["end"]) + off
+                aligned_segments.append(s)
+        del piece, part_segs
+        _free_memory()
+    result["segments"] = sorted(aligned_segments, key=lambda s: s["start"])
     del align_model
     _free_memory()
 

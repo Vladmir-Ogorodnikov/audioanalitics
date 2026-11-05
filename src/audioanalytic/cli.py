@@ -48,6 +48,8 @@ def _cmd_transcribe(a: argparse.Namespace) -> int:
         cfg.device = "cpu"
     if getattr(a, "max_duration", None) is not None:
         cfg.max_duration = float(a.max_duration)
+    if getattr(a, "chunk_duration", None) is not None:
+        cfg.chunk_duration = float(a.chunk_duration)
     cfg.preprocess = not a.no_preprocess
     cfg.terms_file = a.terms
     cfg.badwords_file = a.badwords
@@ -261,6 +263,7 @@ def _cmd_check(a: argparse.Namespace) -> int:
     print("=== Шаг 2/3: пробная транскрипция (полный цикл) ===")
     targs = argparse.Namespace(audio=str(src), out=a.out, language="ru", model=a.model,
                                low_vram=False, cpu=a.cpu, max_duration=a.max_duration,
+                               chunk_duration=a.chunk_duration,
                                no_diarize=a.no_diarize, speakers=a.speakers,
                                min_speakers=None, max_speakers=None, no_preprocess=False,
                                terms=None, badwords=None, no_censor=False)
@@ -344,6 +347,9 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--cpu", action="store_true", help="принудительно CPU (без CUDA)")
     t.add_argument("--max-duration", type=float, metavar="SEC",
                    help="обработать только первые SEC секунд (быстрый тест полного цикла)")
+    t.add_argument("--chunk-duration", type=float, metavar="SEC",
+                   help="резать длинные записи на куски по SEC с при обработке (0 — без разбивки; "
+                        "по умолчанию 300; спасает от нехватки RAM на CPU)")
     t.add_argument("--no-diarize", action="store_true")
     t.add_argument("--speakers", type=int, help="точное число спикеров")
     t.add_argument("--min-speakers", type=int)
@@ -372,6 +378,8 @@ def main(argv: list[str] | None = None) -> int:
     c2.add_argument("--cpu", action="store_true", help="принудительно CPU")
     c2.add_argument("--max-duration", type=float, default=60.0, metavar="SEC",
                     help="сколько секунд файла обработать (по умолчанию 60; 0 — весь файл)")
+    c2.add_argument("--chunk-duration", type=float, default=None, metavar="SEC",
+                    help="размер куска при обработке (0 — без разбивки; по умолчанию 300)")
     c2.add_argument("--no-diarize", action="store_true")
     c2.add_argument("--speakers", type=int, help="точное число спикеров (для диаризации)")
     c2.add_argument("--max-chars", type=int, default=12000, help="лимит символов в чанке")
