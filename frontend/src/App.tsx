@@ -1,27 +1,14 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { api } from "./api";
-import { AuditLogView } from "./components/AuditLogView";
-import { LexiconMetricsView } from "./components/LexiconMetricsView";
 import { LibraryView } from "./components/LibraryView";
 import { PlayerView } from "./components/PlayerView";
-import { QueueModelsView } from "./components/QueueModelsView";
-import type {
-  ModelRegistryItem,
-  RecordingDetail,
-  RecordingSummary,
-  SystemStatus,
-} from "./types";
-
-type ActiveTab = "library" | "lexicon" | "system" | "audit";
+import type { RecordingDetail, RecordingSummary } from "./types";
 
 export const App: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<ActiveTab>("library");
   const [recordings, setRecordings] = useState<RecordingSummary[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedRecording, setSelectedRecording] = useState<RecordingDetail | null>(null);
   const [seekTarget, setSeekTarget] = useState<number | null>(null);
-  const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
-  const [models, setModels] = useState<ModelRegistryItem[]>([]);
   const [toast, setToast] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -34,46 +21,45 @@ export const App: React.FC = () => {
     setErrorMsg(err);
   };
 
-  const fetchAll = useCallback(async () => {
+  const fetchRecordings = useCallback(async () => {
     try {
-      const [recs, sys] = await Promise.all([
-        api.listRecordings(searchQuery),
-        api.getSystemStatus(),
-      ]);
+      const recs = await api.listRecordings(searchQuery);
       setRecordings(recs);
-      setSystemStatus(sys);
     } catch (err) {
-      // не блокируем интерфейс при кратковременной перезагрузке
       console.error(err);
     }
   }, [searchQuery]);
 
   useEffect(() => {
-    fetchAll();
-    api.getModels().then(setModels).catch(() => {});
-  }, [fetchAll]);
+    fetchRecordings();
+  }, [fetchRecordings]);
 
-  // Автообновление прогресса очереди каждые 2 секунды, пока есть активные задачи
   useEffect(() => {
-    const hasPending = recordings.some((r) =>
-      ["queued", "preprocessing", "transcribing", "analyzing"].includes(r.status)
-    );
-    const intervalMs = hasPending ? 1500 : 6000;
+    if (!toast) return;
+    const t = window.setTimeout(() => setToast(null), 4000);
+    return () => window.clearTimeout(t);
+  }, [toast]);
+
+  const activeCount = recordings.filter((r) =>
+    ["queued", "preprocessing", "transcribing", "analyzing"].includes(r.status)
+  ).length;
+
+  useEffect(() => {
+    const intervalMs = activeCount > 0 ? 1500 : 6000;
     const timer = window.setInterval(() => {
-      fetchAll();
+      fetchRecordings();
       if (selectedRecording && selectedRecording.status !== "completed") {
         api.getRecording(selectedRecording.id).then(setSelectedRecording).catch(() => {});
       }
     }, intervalMs);
     return () => window.clearInterval(timer);
-  }, [recordings, selectedRecording, fetchAll]);
+  }, [activeCount, selectedRecording, fetchRecordings]);
 
   const openRecording = async (id: number, seekSec?: number) => {
     try {
       const detail = await api.getRecording(id);
       setSelectedRecording(detail);
       setSeekTarget(seekSec ?? null);
-      setActiveTab("library");
     } catch (err) {
       reportError(err instanceof Error ? err.message : String(err));
     }
@@ -84,7 +70,7 @@ export const App: React.FC = () => {
     try {
       const detail = await api.getRecording(selectedRecording.id);
       setSelectedRecording(detail);
-      fetchAll();
+      fetchRecordings();
     } catch (err) {
       reportError(err instanceof Error ? err.message : String(err));
     }
@@ -92,116 +78,81 @@ export const App: React.FC = () => {
 
   return (
     <div className="app-shell">
-      <header className="topbar">
-        <div className="brand">
-          <span className="brand-badge">ААИИ-2026</span>
-          <div>
-            <h1 className="brand-title">АС «АудиоАналитик ИИ»</h1>
-            <p className="brand-sub">Спринт 1 · Локальная транскрибация, диаризация и база знаний (152-ФЗ)</p>
-          </div>
-        </div>
-
-        <nav className="nav-tabs" aria-label="Разделы системы">
+      <header className="header">
+        <div className="header-inner">
           <button
             type="button"
-            className={`nav-tab ${activeTab === "library" ? "active" : ""}`}
+            className="brand-btn"
             onClick={() => {
               setSelectedRecording(null);
-              setActiveTab("library");
+              setSeekTarget(null);
             }}
           >
-            Библиотека и плеер
+            <span className="brand-dot" aria-hidden="true" />
+            <span className="brand-name">АудиоАналитик</span>
           </button>
-          <button
-            type="button"
-            className={`nav-tab ${activeTab === "lexicon" ? "active" : ""}`}
-            onClick={() => setActiveTab("lexicon")}
-          >
-            Словари и метрики (Спринт 1)
-          </button>
-          <button
-            type="button"
-            className={`nav-tab ${activeTab === "system" ? "active" : ""}`}
-            onClick={() => setActiveTab("system")}
-          >
-            Очередь, GPU и модели
-          </button>
-          <button
-            type="button"
-            className={`nav-tab ${activeTab === "audit" ? "active" : ""}`}
-            onClick={() => setActiveTab("audit")}
-          >
-            Журнал 152-ФЗ
-          </button>
-        </nav>
 
-        <div className="status-pills">
-          {systemStatus && (
-            <>
-              <span className="pill pill-dark" title="Активные и ожидающие задачи в очереди">
-                Очередь: {systemStatus.queue.queued_count + systemStatus.queue.active_count}
-              </span>
-              <span className="pill pill-dark" title="Локальное хранилище и отсутствие телеметрии">
-                🔒 Локальный режим
-              </span>
-            </>
+          {activeCount > 0 && (
+            <div className="queue-indicator" role="status">
+              <span className="pulse-dot" aria-hidden="true" />
+              <span>В обработке: {activeCount}</span>
+            </div>
           )}
         </div>
       </header>
 
-      <main className="container">
+      <main className="main-content">
         {toast && (
-          <div className="banner-toast" role="status">
+          <div className="notice" role="status">
             <span>{toast}</span>
-            <button type="button" className="btn btn-secondary btn-sm" onClick={() => setToast(null)}>
+            <button
+              type="button"
+              className="notice-close"
+              aria-label="Закрыть уведомление"
+              onClick={() => setToast(null)}
+            >
               ✕
             </button>
           </div>
         )}
 
         {errorMsg && (
-          <div className="banner-error" role="alert">
+          <div className="notice notice-error" role="alert">
             <span>{errorMsg}</span>
-            <button type="button" className="btn btn-secondary btn-sm" onClick={() => setErrorMsg(null)}>
+            <button
+              type="button"
+              className="notice-close"
+              aria-label="Закрыть ошибку"
+              onClick={() => setErrorMsg(null)}
+            >
               ✕
             </button>
           </div>
         )}
 
-        {activeTab === "library" &&
-          (selectedRecording ? (
-            <PlayerView
-              recording={selectedRecording}
-              initialSeekSec={seekTarget}
-              onBack={() => {
-                setSelectedRecording(null);
-                setSeekTarget(null);
-              }}
-              onReload={reloadSelected}
-              onNotify={notify}
-              onError={reportError}
-            />
-          ) : (
-            <LibraryView
-              recordings={recordings}
-              searchQuery={searchQuery}
-              onSearchChange={setSearchQuery}
-              onOpenRecording={openRecording}
-              onRefresh={fetchAll}
-              onNotify={notify}
-              onError={reportError}
-            />
-          ))}
-
-        {activeTab === "lexicon" && (
-          <LexiconMetricsView onNotify={notify} onError={reportError} />
+        {selectedRecording ? (
+          <PlayerView
+            recording={selectedRecording}
+            initialSeekSec={seekTarget}
+            onBack={() => {
+              setSelectedRecording(null);
+              setSeekTarget(null);
+            }}
+            onReload={reloadSelected}
+            onNotify={notify}
+            onError={reportError}
+          />
+        ) : (
+          <LibraryView
+            recordings={recordings}
+            searchQuery={searchQuery}
+            onSearchChange={setSearchQuery}
+            onOpenRecording={openRecording}
+            onRefresh={fetchRecordings}
+            onNotify={notify}
+            onError={reportError}
+          />
         )}
-
-        {activeTab === "system" && (
-          <QueueModelsView status={systemStatus} models={models} onRefresh={fetchAll} />
-        )}
-
-        {activeTab === "audit" && <AuditLogView onError={reportError} />}
       </main>
     </div>
   );

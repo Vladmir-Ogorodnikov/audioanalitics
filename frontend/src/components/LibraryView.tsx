@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useRef, useState } from "react";
 import { api } from "../api";
 import type { RecordingSummary } from "../types";
 
@@ -18,31 +18,38 @@ function fmtDuration(sec: number): string {
   const m = Math.floor((s % 3600) / 60);
   const rem = s % 60;
   return h > 0
-    ? `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(rem).padStart(2, "0")}`
+    ? `${h}:${String(m).padStart(2, "0")}:${String(rem).padStart(2, "0")}`
     : `${String(m).padStart(2, "0")}:${String(rem).padStart(2, "0")}`;
 }
 
-function statusBadge(status: string) {
-  switch (status) {
-    case "completed":
-      return <span className="pill pill-green">Готово</span>;
-    case "queued":
-      return <span className="pill pill-amber">В очереди</span>;
-    case "preprocessing":
-      return <span className="pill pill-blue">Предобработка −16 LUFS</span>;
-    case "transcribing":
-      return <span className="pill pill-blue">Распознавание и диаризация</span>;
-    case "failed":
-      return <span className="pill pill-red">Сбой (есть чекпоинт)</span>;
-    default:
-      return <span className="pill pill-blue">{status}</span>;
+function fmtDate(iso: string): string {
+  try {
+    return new Date(iso).toLocaleDateString("ru-RU", {
+      day: "numeric",
+      month: "short",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return "";
   }
 }
 
-function priorityLabel(p: number): string {
-  if (p >= 3) return "Высокий";
-  if (p === 1) return "Низкий (фоновый)";
-  return "Обычный";
+function renderStatus(rec: RecordingSummary) {
+  if (rec.status === "completed") {
+    return <span className="status-tag status-ready">Готово</span>;
+  }
+  if (rec.status === "queued") {
+    return <span className="status-tag status-queued">В очереди</span>;
+  }
+  if (rec.status === "failed") {
+    return <span className="status-tag status-error">Ошибка</span>;
+  }
+  return (
+    <span className="status-tag status-progress">
+      Обработка {Math.round(rec.progress_pct)}%
+    </span>
+  );
 }
 
 export const LibraryView: React.FC<Props> = ({
@@ -54,20 +61,27 @@ export const LibraryView: React.FC<Props> = ({
   onNotify,
   onError,
 }) => {
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [dragging, setDragging] = useState(false);
   const [file, setFile] = useState<File | null>(null);
   const [title, setTitle] = useState("");
-  const [priority, setPriority] = useState(2);
+  const [showOptions, setShowOptions] = useState(false);
   const [speakers, setSpeakers] = useState("");
   const [diarize, setDiarize] = useState(true);
-  const [lowVram, setLowVram] = useState(false);
+  const [priority, setPriority] = useState(2);
   const [busy, setBusy] = useState(false);
+
+  const pickFile = (picked: File | null) => {
+    if (!picked) return;
+    setFile(picked);
+    if (!title) {
+      setTitle(picked.name.replace(/\.[^.]+$/, ""));
+    }
+  };
 
   const handleUpload = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!file) {
-      onError("Выберите аудиофайл формата MP3, WAV или FLAC (до 1 ГБ).");
-      return;
-    }
+    if (!file) return;
     setBusy(true);
     try {
       const fd = new FormData();
@@ -76,11 +90,12 @@ export const LibraryView: React.FC<Props> = ({
       fd.append("priority", String(priority));
       if (speakers.trim()) fd.append("num_speakers", speakers.trim());
       fd.append("diarize", String(diarize));
-      fd.append("low_vram", String(lowVram));
-      const created = await api.uploadRecording(fd);
+      await api.uploadRecording(fd);
       setFile(null);
       setTitle("");
-      onNotify(`Запись «${created.title}» принята и поставлена в очередь (#${created.id}).`);
+      setShowOptions(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+      onNotify("Запись добавлена в обработку.");
       onRefresh();
     } catch (err) {
       onError(err instanceof Error ? err.message : String(err));
@@ -92,10 +107,8 @@ export const LibraryView: React.FC<Props> = ({
   const handleDemo = async () => {
     setBusy(true);
     try {
-      const created = await api.createDemoRecording();
-      onNotify(
-        `Демонстрационная лекция (#${created.id}) создана и запущена в обработку (ffmpeg −16 LUFS → чекпоинты → словари → «Спикер 1/2»).`
-      );
+      await api.createDemoRecording();
+      onNotify("Демо-лекция добавлена в обработку.");
       onRefresh();
     } catch (err) {
       onError(err instanceof Error ? err.message : String(err));
@@ -104,25 +117,22 @@ export const LibraryView: React.FC<Props> = ({
     }
   };
 
-  const handleDelete = async (rec: RecordingSummary) => {
-    if (!window.confirm(`Удалить запись «${rec.title}» и все производные файлы с диска?`)) {
-      return;
-    }
+  const handleDelete = async (e: React.MouseEvent, rec: RecordingSummary) => {
+    e.stopPropagation();
+    if (!window.confirm(`Удалить запись «${rec.title}»?`)) return;
     try {
-      const res = await api.deleteRecording(rec.id);
-      onNotify(
-        `Запись «${rec.title}» и ${res.removed_files.length} файл(ов) полностью удалены за ${res.deleted_in_ms} мс (норматив FR-08: ≤ 20 000 мс).`
-      );
+      await api.deleteRecording(rec.id);
       onRefresh();
     } catch (err) {
       onError(err instanceof Error ? err.message : String(err));
     }
   };
 
-  const handleRetry = async (rec: RecordingSummary) => {
+  const handleRetry = async (e: React.MouseEvent, rec: RecordingSummary) => {
+    e.stopPropagation();
     try {
       await api.retryRecording(rec.id);
-      onNotify(`Запись «${rec.title}» возвращена в очередь с чекпоинта «${rec.checkpoint_stage}» (FR-09).`);
+      onNotify("Обработка возобновлена.");
       onRefresh();
     } catch (err) {
       onError(err instanceof Error ? err.message : String(err));
@@ -130,256 +140,288 @@ export const LibraryView: React.FC<Props> = ({
   };
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: "1.2rem" }}>
-      <div className="grid-2">
-        {/* Форма приёма файла FR-01 */}
-        <div className="card">
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "0.5rem", marginBottom: "0.6rem" }}>
-            <h2 style={{ margin: 0, fontSize: "1.12rem" }}>Загрузка аудиозаписи (FR-01, FR-10)</h2>
+    <div>
+      {/* Загрузка аудиозаписи */}
+      <div
+        className={`upload-box ${dragging ? "dragging" : ""}`}
+        onDragOver={(e) => {
+          e.preventDefault();
+          setDragging(true);
+        }}
+        onDragLeave={() => setDragging(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setDragging(false);
+          pickFile(e.dataTransfer.files?.[0] || null);
+        }}
+      >
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".mp3,.wav,.flac,audio/*"
+          style={{ display: "none" }}
+          onChange={(e) => pickFile(e.target.files?.[0] || null)}
+        />
+
+        <div className="upload-row">
+          <div>
+            <h2 className="upload-title">Новая аудиозапись</h2>
+            <p className="upload-hint">
+              Перетащите файл сюда или выберите на компьютере · MP3, WAV, FLAC до 1 ГБ
+            </p>
+          </div>
+
+          <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
             <button
               type="button"
-              className="btn btn-accent btn-sm"
+              className="btn btn-ghost btn-sm"
               disabled={busy}
               onClick={handleDemo}
-              title="Генерирует учебный WAV-файл 22 кГц и прогоняет весь конвейер Спринта 1"
             >
-              ⚡ Создать демо-лекцию (1 клик)
+              Демо-запись
+            </button>
+            <button
+              type="button"
+              className="btn btn-primary btn-sm"
+              disabled={busy}
+              onClick={() => fileInputRef.current?.click()}
+            >
+              Выбрать файл
             </button>
           </div>
-          <p style={{ margin: "0 0 0.85rem", fontSize: "0.86rem", color: "var(--text-muted)" }}>
-            Поддерживаются MP3, WAV, FLAC до 1 ГБ. Файл автоматически приводится к 16 кГц, моно, −16 LUFS (FR-02).
-          </p>
+        </div>
 
-          <form onSubmit={handleUpload}>
-            <div style={{ marginBottom: "0.75rem" }}>
-              <label className="label" htmlFor="audio-file-input">
-                Аудиофайл (.mp3, .wav, .flac)
-              </label>
+        {file && (
+          <form onSubmit={handleUpload} className="selected-file-bar">
+            <div style={{ display: "flex", flexWrap: "wrap", gap: "0.65rem", alignItems: "center" }}>
               <input
-                id="audio-file-input"
-                type="file"
-                accept=".mp3,.wav,.flac,audio/*"
+                type="text"
                 className="input"
-                onChange={(e) => setFile(e.target.files?.[0] || null)}
+                style={{ flex: "1 1 240px" }}
+                placeholder="Название записи"
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
               />
-            </div>
-
-            <div className="form-row">
-              <div>
-                <label className="label" htmlFor="rec-title-input">
-                  Название записи (необязательно)
-                </label>
-                <input
-                  id="rec-title-input"
-                  type="text"
-                  className="input"
-                  placeholder="Например: Лекция по методам оптимизации"
-                  value={title}
-                  onChange={(e) => setTitle(e.target.value)}
-                />
-              </div>
-
-              <div>
-                <label className="label" htmlFor="rec-prio-select">
-                  Приоритет в очереди (FR-10)
-                </label>
-                <select
-                  id="rec-prio-select"
-                  className="select"
-                  value={priority}
-                  onChange={(e) => setPriority(Number(e.target.value))}
-                >
-                  <option value={3}>Высокий (срочно)</option>
-                  <option value={2}>Обычный</option>
-                  <option value={1}>Низкий (фоновый пакет)</option>
-                </select>
-              </div>
-
-              <div>
-                <label className="label" htmlFor="rec-speakers-input">
-                  Число спикеров (опц.)
-                </label>
-                <input
-                  id="rec-speakers-input"
-                  type="number"
-                  min={1}
-                  max={10}
-                  className="input"
-                  placeholder="Авто"
-                  value={speakers}
-                  onChange={(e) => setSpeakers(e.target.value)}
-                />
-              </div>
-            </div>
-
-            <div style={{ display: "flex", flexWrap: "wrap", gap: "1.2rem", alignItems: "center", justifyContent: "space-between" }}>
-              <div style={{ display: "flex", gap: "1rem", fontSize: "0.88rem" }}>
-                <label style={{ display: "flex", alignItems: "center", gap: "0.35rem", cursor: "pointer" }}>
-                  <input type="checkbox" checked={diarize} onChange={(e) => setDiarize(e.target.checked)} />
-                  Диаризация «Спикер N» (FR-04)
-                </label>
-                <label style={{ display: "flex", alignItems: "center", gap: "0.35rem", cursor: "pointer" }}>
-                  <input type="checkbox" checked={lowVram} onChange={(e) => setLowVram(e.target.checked)} />
-                  Профиль GPU 8 ГБ (CON-03)
-                </label>
-              </div>
-
-              <button type="submit" className="btn btn-primary" disabled={busy || !file}>
-                {busy ? "Загрузка..." : "Поставить в очередь"}
+              <button
+                type="button"
+                className="btn btn-text btn-sm"
+                onClick={() => setShowOptions((v) => !v)}
+              >
+                {showOptions ? "Скрыть параметры" : "Параметры"}
+              </button>
+              <button
+                type="button"
+                className="btn btn-text btn-sm"
+                onClick={() => {
+                  setFile(null);
+                  setTitle("");
+                  if (fileInputRef.current) fileInputRef.current.value = "";
+                }}
+              >
+                Отмена
+              </button>
+              <button type="submit" className="btn btn-primary btn-sm" disabled={busy}>
+                {busy ? "Загрузка…" : "Расшифровать"}
               </button>
             </div>
-          </form>
-        </div>
 
-        {/* Полнотекстовый поиск FR-08 */}
-        <div className="card" style={{ display: "flex", flexDirection: "column", justifyContent: "space-between" }}>
-          <div>
-            <h2 style={{ fontSize: "1.12rem", marginBottom: "0.45rem" }}>
-              Полнотекстовый поиск по базе знаний (FR-08)
-            </h2>
-            <p style={{ margin: "0 0 0.85rem", fontSize: "0.86rem", color: "var(--text-muted)" }}>
-              Мгновенный поиск цитат, терминов и лекций на русском языке с прямым переходом к таймкоду записи (≤ 3 действий, п. 4.8).
-            </p>
-            <div style={{ display: "flex", gap: "0.5rem" }}>
-              <input
-                type="search"
-                className="input"
-                aria-label="Полнотекстовый поиск по записям и транскриптам"
-                placeholder="Введите термин или фразу: например, «регуляризация», «квадратов», «гомоскедастичность»..."
-                value={searchQuery}
-                onChange={(e) => onSearchChange(e.target.value)}
-              />
-              {searchQuery && (
-                <button type="button" className="btn btn-secondary" onClick={() => onSearchChange("")}>
-                  Сбросить
-                </button>
-              )}
+            <div style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>
+              Файл: {file.name} ({(file.size / (1024 * 1024)).toFixed(2)} МБ)
             </div>
-          </div>
 
-          <div style={{ marginTop: "1rem", padding: "0.75rem", background: "var(--surface-alt)", borderRadius: "8px", fontSize: "0.84rem", color: "var(--text-muted)" }}>
-            <strong>Что уже работает в Спринте 1:</strong> приём файлов до 1 ГБ, двухпроходный EBU R128 (−16 LUFS, 16 кГц, моно), чекпоинты каждые 5 мин с автовосстановлением (FR-09), диаризация «Спикер N» с переименованием, пословный плеер (±0,5 с), постобработка терминов, фильтр [НБЗ] без ложных срабатываний и журнал 152-ФЗ.
-          </div>
-        </div>
+            {showOptions && (
+              <div className="options-grid">
+                <div>
+                  <label className="field-label">Число спикеров</label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={10}
+                    className="input"
+                    placeholder="Автоматически"
+                    value={speakers}
+                    onChange={(e) => setSpeakers(e.target.value)}
+                  />
+                </div>
+                <div>
+                  <label className="field-label">Приоритет</label>
+                  <select
+                    className="select"
+                    value={priority}
+                    onChange={(e) => setPriority(Number(e.target.value))}
+                  >
+                    <option value={3}>Высокий</option>
+                    <option value={2}>Обычный</option>
+                    <option value={1}>Низкий</option>
+                  </select>
+                </div>
+                <div style={{ display: "flex", alignItems: "flex-end", paddingBottom: "0.45rem" }}>
+                  <label style={{ display: "flex", alignItems: "center", gap: "0.45rem", fontSize: "0.86rem", cursor: "pointer" }}>
+                    <input
+                      type="checkbox"
+                      checked={diarize}
+                      onChange={(e) => setDiarize(e.target.checked)}
+                    />
+                    Разделять по спикерам
+                  </label>
+                </div>
+              </div>
+            )}
+          </form>
+        )}
+      </div>
+
+      {/* Поиск */}
+      <div className="search-wrap">
+        <span className="search-icon" aria-hidden="true">⌕</span>
+        <input
+          type="search"
+          className="search-input"
+          aria-label="Поиск по записям"
+          placeholder="Поиск по названиям и тексту расшифровок…"
+          value={searchQuery}
+          onChange={(e) => onSearchChange(e.target.value)}
+        />
+        {searchQuery && (
+          <button
+            type="button"
+            className="search-clear"
+            aria-label="Очистить поиск"
+            onClick={() => onSearchChange("")}
+          >
+            ✕
+          </button>
+        )}
       </div>
 
       {/* Библиотека записей */}
-      <div className="card">
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.85rem" }}>
-          <h2 style={{ margin: 0, fontSize: "1.12rem" }}>
-            Библиотека записей ({recordings.length})
-          </h2>
-          <button type="button" className="btn btn-secondary btn-sm" onClick={onRefresh}>
-            Обновить список
-          </button>
-        </div>
+      <div className="section-header">
+        <h3 className="section-title">
+          Записи {recordings.length > 0 ? `(${recordings.length})` : ""}
+        </h3>
+      </div>
 
+      <div className="library-surface">
         {recordings.length === 0 ? (
-          <div style={{ textAlign: "center", padding: "2.2rem 1rem", color: "var(--text-muted)" }}>
+          <div className="empty-state">
             {searchQuery
               ? `По запросу «${searchQuery}» ничего не найдено.`
-              : "Библиотека пока пуста. Загрузите аудиофайл выше или нажмите «⚡ Создать демо-лекцию (1 клик)» для мгновенной проверки!"}
+              : "Записей пока нет. Загрузите аудиофайл или создайте демо-запись."}
           </div>
         ) : (
-          <div className="rec-list">
-            {recordings.map((rec) => (
-              <div key={rec.id} className="rec-card">
-                <div style={{ flex: "1 1 420px" }}>
-                  <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "0.55rem", marginBottom: "0.3rem" }}>
-                    {statusBadge(rec.status)}
-                    <strong style={{ fontSize: "1.02rem" }}>{rec.title}</strong>
-                    <span style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>
-                      #{rec.id} · {rec.file_format.toUpperCase()} · {(rec.file_size_bytes / (1024 * 1024)).toFixed(2)} МБ ·{" "}
-                      {fmtDuration(rec.duration_sec)} · {rec.sample_rate} Гц
-                    </span>
+          recordings.map((rec) => {
+            const isReady = rec.status === "completed";
+            const isFailed = rec.status === "failed";
+            const isRunning = !isReady && !isFailed;
+
+            return (
+              <div
+                key={rec.id}
+                className={`rec-item ${isReady ? "clickable" : ""}`}
+                onClick={() => {
+                  if (isReady) onOpenRecording(rec.id);
+                }}
+              >
+                <div className="rec-main">
+                  <div className="rec-title-row">
+                    <span className="rec-name">{rec.title}</span>
+                    {renderStatus(rec)}
                   </div>
 
-                  <div style={{ fontSize: "0.84rem", color: "var(--text-muted)", display: "flex", flexWrap: "wrap", gap: "0.9rem" }}>
-                    <span>Приоритет: <strong>{priorityLabel(rec.priority)}</strong></span>
-                    <span>Чекпоинт (FR-09): <code>{rec.checkpoint_stage}</code></span>
-                    {rec.word_count > 0 && <span>Слов: <strong>{rec.word_count}</strong></span>}
-                    {rec.processing_time_sec !== null && (
-                      <span>Обработано за: <strong>{rec.processing_time_sec.toFixed(1)} с</strong></span>
-                    )}
-                    {rec.estimated_wait_sec !== null && rec.status !== "completed" && (
-                      <span>Расчётное ожидание (ETA): <strong>~{Math.ceil(rec.estimated_wait_sec)} с</strong></span>
+                  <div className="rec-meta">
+                    <span>{fmtDuration(rec.duration_sec)}</span>
+                    {rec.word_count > 0 && <span>· {rec.word_count} слов</span>}
+                    <span>· {rec.file_format.toUpperCase()}</span>
+                    {rec.created_at && <span>· {fmtDate(rec.created_at)}</span>}
+                    {isRunning && rec.estimated_wait_sec !== null && (
+                      <span>· осталось ~{Math.ceil(rec.estimated_wait_sec)} с</span>
                     )}
                   </div>
 
-                  {rec.status !== "completed" && (
-                    <div style={{ marginTop: "0.55rem" }}>
-                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.8rem", marginBottom: "0.2rem" }}>
-                        <span>{rec.stage_message}</span>
-                        <strong>{rec.progress_pct}%</strong>
-                      </div>
-                      <div className="progress-track">
-                        <div className="progress-fill" style={{ width: `${Math.min(100, rec.progress_pct)}%` }} />
-                      </div>
+                  {isRunning && (
+                    <div className="thin-progress" title={rec.stage_message}>
+                      <div
+                        className="thin-progress-bar"
+                        style={{ width: `${Math.max(4, Math.min(100, rec.progress_pct))}%` }}
+                      />
                     </div>
                   )}
 
-                  {rec.error_message && (
-                    <div style={{ marginTop: "0.4rem", color: "var(--danger)", fontSize: "0.84rem" }}>
-                      Ошибка: {rec.error_message}
+                  {isFailed && rec.error_message && (
+                    <div style={{ marginTop: "0.35rem", fontSize: "0.82rem", color: "var(--danger)" }}>
+                      {rec.error_message}
                     </div>
                   )}
 
                   {rec.search_snippet && (
-                    <div className="snippet-box">
-                      <div><strong>Найденная цитата:</strong> {rec.search_snippet}</div>
+                    <div
+                      className="quote-match"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (isReady) {
+                          onOpenRecording(rec.id, rec.matched_timecode_sec ?? 0);
+                        }
+                      }}
+                    >
+                      <span>{rec.search_snippet}</span>
                       {rec.matched_timecode_sec !== null && (
                         <button
                           type="button"
-                          className="btn btn-primary btn-sm"
-                          style={{ marginTop: "0.4rem" }}
-                          onClick={() => onOpenRecording(rec.id, rec.matched_timecode_sec ?? 0)}
+                          className="btn btn-ghost btn-sm"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onOpenRecording(rec.id, rec.matched_timecode_sec ?? 0);
+                          }}
                         >
-                          ▶ Открыть на таймкоде {fmtDuration(rec.matched_timecode_sec)}
+                          ▶ {fmtDuration(rec.matched_timecode_sec)}
                         </button>
                       )}
                     </div>
                   )}
                 </div>
 
-                <div style={{ display: "flex", flexWrap: "wrap", gap: "0.45rem" }}>
-                  {rec.status === "completed" && (
+                <div className="rec-actions" onClick={(e) => e.stopPropagation()}>
+                  {isReady && (
                     <>
                       <button
                         type="button"
-                        className="btn btn-primary btn-sm"
+                        className="btn btn-ghost btn-sm"
                         onClick={() => onOpenRecording(rec.id)}
                       >
-                        Открыть транскрипт и плеер
+                        Открыть
                       </button>
                       <a
-                        className="btn btn-secondary btn-sm"
+                        className="btn btn-text btn-sm"
                         href={`/api/v1/recordings/${rec.id}/export?format=txt`}
                         download
+                        title="Скачать TXT"
                       >
-                        Экспорт TXT
+                        TXT
                       </a>
                     </>
                   )}
-                  {rec.status === "failed" && (
+                  {isFailed && (
                     <button
                       type="button"
-                      className="btn btn-accent btn-sm"
-                      onClick={() => handleRetry(rec)}
+                      className="btn btn-ghost btn-sm"
+                      onClick={(e) => handleRetry(e, rec)}
                     >
-                      Возобновить с чекпоинта
+                      Повторить
                     </button>
                   )}
                   <button
                     type="button"
-                    className="btn btn-danger btn-sm"
-                    onClick={() => handleDelete(rec)}
+                    className="btn btn-danger-text btn-sm"
+                    onClick={(e) => handleDelete(e, rec)}
+                    title="Удалить запись"
+                    aria-label="Удалить запись"
                   >
                     Удалить
                   </button>
                 </div>
               </div>
-            ))}
-          </div>
+            );
+          })
         )}
       </div>
     </div>
