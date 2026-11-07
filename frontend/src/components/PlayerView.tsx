@@ -11,10 +11,16 @@ interface Props {
   onError: (err: string) => void;
 }
 
-function fmtPrecise(sec: number): string {
-  const m = Math.floor(sec / 60);
-  const s = (sec % 60).toFixed(1).padStart(4, "0");
-  return `${String(m).padStart(2, "0")}:${s}`;
+const RATES = [1, 1.25, 1.5, 2, 0.75];
+
+function fmtClock(sec: number): string {
+  const s = Math.max(0, Math.floor(sec || 0));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const rem = s % 60;
+  return h > 0
+    ? `${h}:${String(m).padStart(2, "0")}:${String(rem).padStart(2, "0")}`
+    : `${String(m).padStart(2, "0")}:${String(rem).padStart(2, "0")}`;
 }
 
 export const PlayerView: React.FC<Props> = ({
@@ -26,69 +32,94 @@ export const PlayerView: React.FC<Props> = ({
   onError,
 }) => {
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
-  const [playbackRate, setPlaybackRate] = useState(1.0);
+  const [duration, setDuration] = useState(recording.duration_sec || 0);
+  const [rate, setRate] = useState(1);
 
-  // Редактирование отдельной реплики (FR-07)
+  // Редактирование реплики
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editText, setEditText] = useState("");
   const [editSpeaker, setEditSpeaker] = useState("");
 
-  // Переименование спикера по всей записи (FR-04)
-  const [renameTarget, setRenameTarget] = useState<string>("");
-  const [renameValue, setRenameValue] = useState<string>("");
+  // Быстрое переименование спикера в одну строку
+  const [renamingSpeaker, setRenamingSpeaker] = useState<string | null>(null);
+  const [renameVal, setRenameVal] = useState("");
 
   useEffect(() => {
-    if (initialSeekSec !== null && initialSeekSec !== undefined && audioRef.current) {
-      audioRef.current.currentTime = initialSeekSec;
-      setCurrentTime(initialSeekSec);
+    setDuration(recording.duration_sec || 0);
+  }, [recording.duration_sec]);
+
+  useEffect(() => {
+    const el = audioRef.current;
+    if (!el || initialSeekSec === null || initialSeekSec === undefined) return;
+    const applySeek = () => {
+      el.currentTime = Math.max(0, initialSeekSec);
+      setCurrentTime(el.currentTime);
+    };
+    if (el.readyState >= 1) {
+      applySeek();
+    } else {
+      el.addEventListener("loadedmetadata", applySeek, { once: true });
     }
   }, [initialSeekSec, recording.id]);
 
-  const seekTo = (sec: number | null) => {
-    if (sec === null || sec === undefined || !audioRef.current) return;
-    const target = Math.max(0, sec);
-    audioRef.current.currentTime = target;
-    setCurrentTime(target);
-    audioRef.current.play().catch(() => {
-      // autoplay может требовать явного действия браузера
-    });
-  };
-
-  const changeRate = (rate: number) => {
-    setPlaybackRate(rate);
-    if (audioRef.current) {
-      audioRef.current.playbackRate = rate;
+  const togglePlay = () => {
+    const el = audioRef.current;
+    if (!el) return;
+    if (el.paused) {
+      el.play().catch(() => {});
+    } else {
+      el.pause();
     }
   };
 
-  const startEditUtterance = (u: UtteranceItem) => {
+  const seekTo = (sec: number | null, autoPlay = true) => {
+    const el = audioRef.current;
+    if (sec === null || sec === undefined || !el) return;
+    const next = Math.max(0, sec);
+    el.currentTime = next;
+    setCurrentTime(next);
+    if (autoPlay) {
+      el.play().catch(() => {});
+    }
+  };
+
+  const cycleRate = () => {
+    const idx = RATES.indexOf(rate);
+    const next = RATES[(idx + 1) % RATES.length];
+    setRate(next);
+    if (audioRef.current) {
+      audioRef.current.playbackRate = next;
+    }
+  };
+
+  const startEdit = (u: UtteranceItem) => {
     setEditingId(u.id);
     setEditText(u.text);
     setEditSpeaker(u.speaker);
   };
 
-  const saveEditUtterance = async (u: UtteranceItem) => {
+  const saveEdit = async (u: UtteranceItem) => {
     try {
       await api.updateUtterance(u.id, editText, editSpeaker);
       setEditingId(null);
-      onNotify(`Реплика ${u.timecode} сохранена (FR-07).`);
       onReload();
     } catch (err) {
       onError(err instanceof Error ? err.message : String(err));
     }
   };
 
-  const handleRenameSpeaker = async (e: React.FormEvent) => {
+  const submitSpeakerRename = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!renameTarget || !renameValue.trim()) return;
+    if (!renamingSpeaker || !renameVal.trim() || renameVal.trim() === renamingSpeaker) {
+      setRenamingSpeaker(null);
+      return;
+    }
     try {
-      const res = await api.renameSpeaker(recording.id, renameTarget, renameValue.trim());
-      onNotify(
-        `Метка «${renameTarget}» заменена на «${renameValue.trim()}» в ${res.updated_utterances} репликах (FR-04).`
-      );
-      setRenameTarget("");
-      setRenameValue("");
+      await api.renameSpeaker(recording.id, renamingSpeaker, renameVal.trim());
+      setRenamingSpeaker(null);
+      onNotify("Имя спикера обновлено.");
       onReload();
     } catch (err) {
       onError(err instanceof Error ? err.message : String(err));
@@ -96,268 +127,233 @@ export const PlayerView: React.FC<Props> = ({
   };
 
   const tr = recording.transcript;
-  const corrections = tr?.meta?.term_corrections || [];
+  const totalSec = Math.max(duration, recording.duration_sec || 0, 0.1);
 
   return (
     <div>
-      {/* Верхняя панель навигации и экспорта */}
-      <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "space-between", alignItems: "center", gap: "0.75rem", marginBottom: "1rem" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
-          <button type="button" className="btn btn-secondary btn-sm" onClick={onBack}>
-            ← К списку записей
+      {/* Шапка записи */}
+      <div className="player-topbar">
+        <div>
+          <button type="button" className="btn btn-text btn-sm" onClick={onBack} style={{ marginLeft: "-0.55rem" }}>
+            ← Все записи
           </button>
-          <div>
-            <h2 style={{ margin: 0, fontSize: "1.2rem" }}>{recording.title}</h2>
-            <div style={{ fontSize: "0.82rem", color: "var(--text-muted)" }}>
-              Параметры FR-02: {recording.sample_rate} Гц, {recording.channels === 1 ? "моно" : "стерео"}, −16 LUFS ·{" "}
-              Движок: {tr?.engine_used || "—"}
-            </div>
+          <h1 className="player-heading">{recording.title}</h1>
+          <div className="player-submeta">
+            {fmtClock(totalSec)}
+            {tr ? ` · ${tr.word_count} слов` : ""}
+            {tr && tr.speakers.length > 0 ? ` · спикеров: ${tr.speakers.length}` : ""}
           </div>
         </div>
 
-        <div style={{ display: "flex", gap: "0.5rem" }}>
+        <div style={{ display: "flex", gap: "0.45rem" }}>
           <a
             className="btn btn-primary btn-sm"
             href={`/api/v1/recordings/${recording.id}/export?format=txt`}
             download
           >
-            ⬇ Экспорт TXT
+            Скачать TXT
           </a>
           <a
-            className="btn btn-secondary btn-sm"
+            className="btn btn-ghost btn-sm"
             href={`/api/v1/recordings/${recording.id}/export?format=json`}
             download
           >
-            ⬇ Экспорт JSON
+            JSON
           </a>
         </div>
       </div>
 
-      {/* Липкий аудиоплеер с поддержкой перемотки по словам (±0,5 с, FR-07) */}
-      <div className="sticky-player">
-        <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "1rem" }}>
-          <audio
-            ref={audioRef}
-            controls
-            preload="metadata"
-            src={`/api/v1/recordings/${recording.id}/audio`}
-            onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
-            style={{ flex: "1 1 380px", height: "40px" }}
+      {/* Минималистичный аудиоплеер */}
+      <div className="player-bar">
+        <audio
+          ref={audioRef}
+          preload="metadata"
+          src={`/api/v1/recordings/${recording.id}/audio`}
+          onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
+          onLoadedMetadata={(e) => {
+            if (e.currentTarget.duration && Number.isFinite(e.currentTarget.duration)) {
+              setDuration(e.currentTarget.duration);
+            }
+          }}
+          onPlay={() => setPlaying(true)}
+          onPause={() => setPlaying(false)}
+          onEnded={() => setPlaying(false)}
+        />
+
+        <div className="player-controls">
+          <button
+            type="button"
+            className="play-btn"
+            onClick={togglePlay}
+            aria-label={playing ? "Пауза" : "Воспроизвести"}
+          >
+            {playing ? "❚❚" : "▶"}
+          </button>
+
+          <span className="time-label">{fmtClock(currentTime)}</span>
+
+          <input
+            type="range"
+            className="scrubber"
+            min={0}
+            max={totalSec}
+            step={0.1}
+            value={Math.min(currentTime, totalSec)}
+            aria-label="Позиция воспроизведения"
+            onChange={(e) => seekTo(Number(e.target.value), false)}
           />
-          <div style={{ display: "flex", alignItems: "center", gap: "0.35rem", fontSize: "0.84rem" }}>
-            <span style={{ color: "var(--text-muted)" }}>Скорость:</span>
-            {[0.75, 1.0, 1.25, 1.5, 2.0].map((r) => (
-              <button
-                key={r}
-                type="button"
-                className={`btn btn-sm ${playbackRate === r ? "btn-primary" : "btn-secondary"}`}
-                onClick={() => changeRate(r)}
-              >
-                {r}x
-              </button>
-            ))}
-          </div>
-          <span className="pill pill-blue" title="Текущая позиция воспроизведения">
-            Позиция: {fmtPrecise(currentTime)}
-          </span>
-        </div>
-        <div style={{ fontSize: "0.8rem", color: "var(--text-muted)", marginTop: "0.4rem" }}>
-          Нажмите на <strong>любое слово</strong> в тексте ниже для мгновенного перехода плеера на его таймкод (точность ±0,1 с, норматив FR-07: ±0,5 с).
+
+          <span className="time-label">{fmtClock(totalSec)}</span>
+
+          <button
+            type="button"
+            className="speed-btn"
+            onClick={cycleRate}
+            title="Скорость воспроизведения"
+          >
+            {rate}x
+          </button>
         </div>
       </div>
 
+      {/* Компактная полоска переименования спикеров */}
+      {tr && tr.speakers.length > 0 && (
+        <div className="speakers-strip">
+          {tr.speakers.map((sp) =>
+            renamingSpeaker === sp ? (
+              <form key={sp} onSubmit={submitSpeakerRename} className="speaker-rename-inline">
+                <input
+                  type="text"
+                  autoFocus
+                  value={renameVal}
+                  placeholder="Имя спикера"
+                  onChange={(e) => setRenameVal(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") setRenamingSpeaker(null);
+                  }}
+                />
+                <button type="submit" className="btn btn-primary btn-sm" style={{ borderRadius: "999px", padding: "0.18rem 0.6rem" }}>
+                  ОК
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-text btn-sm"
+                  style={{ borderRadius: "999px", padding: "0.18rem 0.45rem" }}
+                  onClick={() => setRenamingSpeaker(null)}
+                >
+                  ✕
+                </button>
+              </form>
+            ) : (
+              <button
+                key={sp}
+                type="button"
+                className="speaker-pill"
+                title="Нажмите, чтобы переименовать спикера"
+                onClick={() => {
+                  setRenamingSpeaker(sp);
+                  setRenameVal(sp);
+                }}
+              >
+                <span>{sp}</span>
+                <span style={{ opacity: 0.45 }}>✎</span>
+              </button>
+            )
+          )}
+        </div>
+      )}
+
+      {/* Поток реплик транскрипта */}
       {!tr ? (
-        <div className="card">Транскрипт ещё формируется. Пожалуйста, дождитесь завершения очереди.</div>
+        <div className="library-surface">
+          <div className="empty-state">Расшифровка ещё выполняется…</div>
+        </div>
       ) : (
-        <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 2.2fr) minmax(290px, 1fr)", gap: "1.15rem", alignItems: "start" }}>
-          {/* Колонка реплик с кликабельными словами */}
-          <div>
-            {tr.utterances.map((u) => {
-              const isActive = currentTime >= u.start_sec && currentTime <= u.end_sec + 0.15;
-              const isEditing = editingId === u.id;
+        <div className="transcript-stream">
+          {tr.utterances.map((u) => {
+            const isActive = currentTime >= u.start_sec && currentTime <= u.end_sec + 0.15;
+            const isEditing = editingId === u.id;
 
-              return (
-                <div key={u.id} className={`utterance-card ${isActive ? "active" : ""}`}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.45rem", gap: "0.5rem" }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", flexWrap: "wrap" }}>
-                      <button
-                        type="button"
-                        className="btn btn-secondary btn-sm"
-                        onClick={() => seekTo(u.start_sec)}
-                        title="Перейти к началу реплики"
-                      >
-                        ▶ {u.timecode}
-                      </button>
-                      <strong style={{ color: "var(--primary)" }}>{u.speaker}</strong>
-                      {u.is_edited && <span className="pill pill-amber">отредактировано</span>}
-                    </div>
-
-                    {!isEditing && (
-                      <button
-                        type="button"
-                        className="btn btn-secondary btn-sm"
-                        onClick={() => startEditUtterance(u)}
-                      >
-                        Править реплику
-                      </button>
-                    )}
+            return (
+              <div key={u.id} className={`turn-block ${isActive ? "active" : ""}`}>
+                <div className="turn-header">
+                  <div className="turn-meta">
+                    <button
+                      type="button"
+                      className="timecode-btn"
+                      onClick={() => seekTo(u.start_sec)}
+                      title="Перейти к началу реплики"
+                    >
+                      {fmtClock(u.start_sec)}
+                    </button>
+                    <span className="turn-speaker">{u.speaker}</span>
+                    {u.is_edited && <span className="edited-dot">· изменено</span>}
                   </div>
 
-                  {isEditing ? (
-                    <div style={{ display: "flex", flexDirection: "column", gap: "0.55rem", marginTop: "0.5rem" }}>
-                      <div className="form-row" style={{ marginBottom: 0 }}>
-                        <div>
-                          <label className="label">Спикер реплики</label>
-                          <input
-                            type="text"
-                            className="input"
-                            value={editSpeaker}
-                            onChange={(e) => setEditSpeaker(e.target.value)}
-                          />
-                        </div>
-                      </div>
-                      <div>
-                        <label className="label">Текст реплики (фильтр [НБЗ] применяется автоматически)</label>
-                        <textarea
-                          rows={3}
-                          className="textarea"
-                          style={{ fontFamily: "inherit", fontSize: "0.95rem" }}
-                          value={editText}
-                          onChange={(e) => setEditText(e.target.value)}
-                        />
-                      </div>
-                      <div style={{ display: "flex", gap: "0.5rem" }}>
-                        <button type="button" className="btn btn-primary btn-sm" onClick={() => saveEditUtterance(u)}>
-                          Сохранить
-                        </button>
-                        <button type="button" className="btn btn-secondary btn-sm" onClick={() => setEditingId(null)}>
-                          Отмена
-                        </button>
-                      </div>
-                    </div>
-                  ) : u.words && u.words.length > 0 ? (
-                    <div>
-                      {u.words.map((w, idx) => {
-                        const wordActive =
-                          w.start !== null &&
-                          w.end !== null &&
-                          currentTime >= w.start &&
-                          currentTime <= w.end + 0.08;
-                        const isNbz = w.text.includes("[НБЗ]");
-                        return (
-                          <button
-                            key={`${u.id}-${idx}`}
-                            type="button"
-                            className={`word-chip ${wordActive ? "current" : ""} ${isNbz ? "nbz" : ""}`}
-                            onClick={() => seekTo(w.start ?? u.start_sec)}
-                            title={
-                              w.start !== null
-                                ? `Таймкод: ${fmtPrecise(w.start)} с`
-                                : `Реплика: ${fmtPrecise(u.start_sec)} с`
-                            }
-                          >
-                            {w.text}
-                          </button>
-                        );
-                      })}
-                    </div>
-                  ) : (
-                    <p style={{ margin: 0 }}>{u.text}</p>
+                  {!isEditing && (
+                    <button
+                      type="button"
+                      className="btn btn-text btn-sm turn-edit-trigger"
+                      onClick={() => startEdit(u)}
+                    >
+                      Изменить
+                    </button>
                   )}
                 </div>
-              );
-            })}
-          </div>
 
-          {/* Правая панель: спикеры FR-04, статистика терминов FR-03 и чекпоинты FR-09 */}
-          <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
-            <div className="card">
-              <h3 style={{ fontSize: "1rem" }}>Управление спикерами (FR-04)</h3>
-              <p style={{ fontSize: "0.82rem", color: "var(--text-muted)", marginTop: 0 }}>
-                Метки диаризации автоматически приведены к виду «Спикер N». Вы можете переименовать любого участника:
-              </p>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: "0.4rem", marginBottom: "0.75rem" }}>
-                {tr.speakers.map((sp) => (
-                  <button
-                    key={sp}
-                    type="button"
-                    className={`btn btn-sm ${renameTarget === sp ? "btn-primary" : "btn-secondary"}`}
-                    onClick={() => {
-                      setRenameTarget(sp);
-                      setRenameValue(sp);
-                    }}
-                  >
-                    👤 {sp}
-                  </button>
-                ))}
-              </div>
-              {renameTarget && (
-                <form onSubmit={handleRenameSpeaker} style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
-                  <label className="label">Новое имя для «{renameTarget}»:</label>
-                  <input
-                    type="text"
-                    className="input"
-                    placeholder="Например: Доцент Долженкова М. Л."
-                    value={renameValue}
-                    onChange={(e) => setRenameValue(e.target.value)}
-                  />
-                  <div style={{ display: "flex", gap: "0.4rem" }}>
-                    <button type="submit" className="btn btn-primary btn-sm">
-                      Переименовать везде
-                    </button>
-                    <button type="button" className="btn btn-secondary btn-sm" onClick={() => setRenameTarget("")}>
-                      Отмена
-                    </button>
+                {isEditing ? (
+                  <div style={{ display: "flex", flexDirection: "column", gap: "0.55rem", marginTop: "0.35rem" }}>
+                    <input
+                      type="text"
+                      className="input"
+                      style={{ maxWidth: "240px" }}
+                      placeholder="Спикер"
+                      value={editSpeaker}
+                      onChange={(e) => setEditSpeaker(e.target.value)}
+                    />
+                    <textarea
+                      rows={3}
+                      className="textarea"
+                      value={editText}
+                      onChange={(e) => setEditText(e.target.value)}
+                    />
+                    <div style={{ display: "flex", gap: "0.45rem" }}>
+                      <button type="button" className="btn btn-primary btn-sm" onClick={() => saveEdit(u)}>
+                        Сохранить
+                      </button>
+                      <button type="button" className="btn btn-ghost btn-sm" onClick={() => setEditingId(null)}>
+                        Отмена
+                      </button>
+                    </div>
                   </div>
-                </form>
-              )}
-            </div>
-
-            <div className="card">
-              <h3 style={{ fontSize: "1rem" }}>Лингвистический контроль (FR-03)</h3>
-              <div style={{ fontSize: "0.86rem", display: "flex", flexDirection: "column", gap: "0.4rem" }}>
-                <div>Всего слов: <strong>{tr.word_count}</strong></div>
-                <div>Маркировано [НБЗ]: <strong>{tr.censored_count}</strong></div>
-                {tr.term_coverage?.terms_total !== undefined && (
-                  <div>
-                    Найдено терминов словаря:{" "}
-                    <strong>
-                      {tr.term_coverage.terms_found} из {tr.term_coverage.terms_total} (
-                      {((tr.term_coverage.recall || 0) * 100).toFixed(0)}%)
-                    </strong>
+                ) : u.words && u.words.length > 0 ? (
+                  <div className="turn-words">
+                    {u.words.map((w, idx) => {
+                      const isSpoken =
+                        w.start !== null &&
+                        w.end !== null &&
+                        currentTime >= w.start &&
+                        currentTime <= w.end + 0.08;
+                      const isNbz = w.text.includes("[НБЗ]");
+                      return (
+                        <React.Fragment key={`${u.id}-${idx}`}>
+                          <button
+                            type="button"
+                            className={`word-token ${isSpoken ? "spoken" : ""} ${isNbz ? "censored" : ""}`}
+                            onClick={() => seekTo(w.start ?? u.start_sec)}
+                          >
+                            {w.text}
+                          </button>{" "}
+                        </React.Fragment>
+                      );
+                    })}
                   </div>
+                ) : (
+                  <div className="turn-words">{u.text}</div>
                 )}
               </div>
-
-              {corrections.length > 0 && (
-                <div style={{ marginTop: "0.75rem" }}>
-                  <div className="label">Автоисправленные опечатки терминов:</div>
-                  <ul style={{ margin: "0.25rem 0 0", paddingLeft: "1.1rem", fontSize: "0.83rem" }}>
-                    {corrections.map((c, idx) => (
-                      <li key={idx}>
-                        <code>{c.from}</code> → <strong>{c.to}</strong>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-            </div>
-
-            <div className="card">
-              <h3 style={{ fontSize: "1rem" }}>Журнал чекпоинтов задачи (FR-09)</h3>
-              {recording.checkpoint_history.length === 0 ? (
-                <div style={{ fontSize: "0.84rem", color: "var(--text-muted)" }}>Чекпоинты отсутствуют.</div>
-              ) : (
-                <ul style={{ margin: 0, paddingLeft: "1.1rem", fontSize: "0.82rem", display: "flex", flexDirection: "column", gap: "0.3rem" }}>
-                  {recording.checkpoint_history.map((ck, idx) => (
-                    <li key={idx}>
-                      <strong>{ck.stage}</strong>: {ck.note}
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-          </div>
+            );
+          })}
         </div>
       )}
     </div>
