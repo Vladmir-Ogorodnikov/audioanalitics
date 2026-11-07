@@ -56,3 +56,35 @@ def test_ensure_disk_space_message(monkeypatch, capsys):
     with pytest.raises(RuntimeError) as e:
         winfix.ensure_disk_space(5, "тест")
     assert "PIP_CACHE_DIR" in str(e.value)
+
+
+def test_load_dotenv_and_low_vram(tmp_path, monkeypatch):
+    from audioanalytic.config import SttConfig, load_dotenv
+
+    env_f = tmp_path / ".env"
+    env_f.write_text("# comment\nCUSTOM_TEST_KEY='hello_val'\n", encoding="utf-8")
+    monkeypatch.delenv("CUSTOM_TEST_KEY", raising=False)
+    load_dotenv(env_f)
+    import os
+    assert os.environ.get("CUSTOM_TEST_KEY") == "hello_val"
+
+    cfg = SttConfig.low_vram()
+    assert cfg.model == "large-v3-turbo"
+    assert cfg.compute_type == "int8_float16"
+
+
+def test_cli_check_full_cycle_with_mock_whisperx(tmp_path, monkeypatch):
+    import sys
+    from audioanalytic.server.demo_audio import generate_demo_lecture_wav
+    from test_full_cycle import make_fake_whisperx
+
+    wav = generate_demo_lecture_wav(tmp_path / "lec.wav", duration_sec=6.0, sr=16000)
+    fake = make_fake_whisperx()
+    monkeypatch.setitem(sys.modules, "whisperx", fake)
+    monkeypatch.setitem(sys.modules, "whisperx.diarize", fake.diarize)
+    monkeypatch.setenv("HF_TOKEN", "hf_fake")
+
+    out_dir = tmp_path / "out_check"
+    rc = main(["check", str(wav), "--cpu", "--max-duration", "5", "--out", str(out_dir), "--model", "tiny"])
+    assert rc == 0
+    assert (out_dir / "lec" / "transcript.json").is_file()

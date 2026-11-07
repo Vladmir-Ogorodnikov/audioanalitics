@@ -1,0 +1,39 @@
+# Локальное развёртывание АС «АудиоАналитик ИИ» (п. 4.6, NFR-04.1, NFR-04.2)
+# Веб-интерфейс и СУБД публикуются СТРОГО на 127.0.0.1 (недоступны из внешней сети).
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: audioanalytic-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: audioanalytic
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-audioanalytic_local}
+      POSTGRES_DB: audioanalytic
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - "${USERPROFILE:-~}/.audioanalytic/pgdata:/var/lib/postgresql/data"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U audioanalytic -d audioanalytic"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    container_name: audioanalytic-app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://audioanalytic:${POSTGRES_PASSWORD:-audioanalytic_local}@db:5432/audioanalytic
+      AUDIOANALYTIC_DATA_DIR: /data
+      HF_TOKEN: ${HF_TOKEN:-}
+      HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-0}
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - "${USERPROFILE:-~}/.audioanalytic/data:/data"
+      - "${USERPROFILE:-~}/.cache/huggingface:/root/.cache/huggingface"

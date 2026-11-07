@@ -1,4 +1,4 @@
-"""Настройки конвейера распознавания речи."""
+"""Настройки конвейера распознавания речи и серверного окружения."""
 from __future__ import annotations
 
 import os
@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 def load_dotenv(path: str | Path = ".env") -> None:
-    """Минимальный загрузчик .env (без зависимостей): HF_TOKEN и т.п.
+    """Минимальный загрузчик .env (без зависимостей): HF_TOKEN, DATABASE_URL и т.п.
 
     Читает файл вида KEY=VALUE (строки с '#' и пустые пропускаются), значения в
     кавычках снимаются. Уже установленные переменные окружения НЕ перезаписывает:
@@ -26,6 +26,15 @@ def load_dotenv(path: str | Path = ".env") -> None:
             os.environ[key] = val
 
 
+def get_data_dir() -> Path:
+    """Каталог локального хранения данных внутри папки текущего пользователя ОС (NFR-04.1)."""
+    raw = os.environ.get("AUDIOANALYTIC_DATA_DIR")
+    base = Path(raw).expanduser() if raw else (Path.home() / ".audioanalytic")
+    for sub in ("uploads", "preprocessed", "checkpoints", "exports", "dictionaries", "logs"):
+        (base / sub).mkdir(parents=True, exist_ok=True)
+    return base
+
+
 @dataclass
 class SttConfig:
     language: str = "ru"
@@ -42,14 +51,20 @@ class SttConfig:
     hf_token: str | None = field(default_factory=lambda: os.environ.get("HF_TOKEN"))
     # FR-02: предобработка аудио (16 кГц, моно, -16 LUFS) перед распознаванием
     preprocess: bool = True
-    # FR-03: словарь терминов (initial prompt + оценка полноты) и файл плохих слов
+    preprocessed_path: str | None = None
+    # FR-03: словарь терминов (initial prompt + постобработка + оценка полноты) и файл плохих слов
     terms_file: str | None = None
     badwords_file: str | None = None
     censor: bool = True  # маркировка [НБЗ]
+    postprocess_terms: bool = True  # fuzzy-исправление опечаток в терминах
+    # FR-04: приводить метки SPEAKER_00 -> «Спикер 1»
+    normalize_speakers: bool = True
+    # FR-09: путь к файлу чекпоинта (каждые 5 мин / chunk_duration)
+    checkpoint_path: str | None = None
     # Обработать только первые N секунд (0/None — весь файл). Для быстрых тестов.
     max_duration: float | None = None
     # Последовательная обработка длинных записей кусками по N секунд (0 — без разбивки).
-    # Спасает от OOM (mkl_malloc) на CPU при 60-минутных записях и крупных моделях.
+    # 300 с = 5 минут (соответствует интервалу чекпоинтов FR-09 и защищает от OOM).
     chunk_duration: float = 300.0
 
     @classmethod
@@ -58,3 +73,25 @@ class SttConfig:
         base = dict(model="large-v3-turbo", compute_type="int8_float16", batch_size=8)
         base.update(kw)
         return cls(**base)
+
+
+@dataclass
+class ServerSettings:
+    """Настройки локального сервера (FastAPI + БД + изоляция 152-ФЗ)."""
+    host: str = field(default_factory=lambda: os.environ.get("AUDIOANALYTIC_HOST", "127.0.0.1"))
+    port: int = field(default_factory=lambda: int(os.environ.get("AUDIOANALYTIC_PORT", "8000")))
+    data_dir: Path = field(default_factory=get_data_dir)
+    database_url: str = field(default="")
+    audit_retention_days: int = field(
+        default_factory=lambda: max(90, int(os.environ.get("AUDIOANALYTIC_AUDIT_DAYS", "90")))
+    )
+    max_upload_bytes: int = 1024 ** 3  # FR-01: до 1 ГБ
+
+    def __post_init__(self) -> None:
+        if not self.database_url:
+            env_db = os.environ.get("DATABASE_URL")
+            if env_db:
+                self.database_url = env_db
+            else:
+                db_file = (self.data_dir / "audioanalytic.db").resolve()
+                self.database_url = f"sqlite:///{db_file.as_posix()}"

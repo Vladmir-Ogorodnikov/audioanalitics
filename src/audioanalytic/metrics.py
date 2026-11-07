@@ -5,50 +5,44 @@ WER/CER считаются классическим расстоянием ре�
 регистру, удаление пунктуации, разбивка на слова/символы. Метка [НБЗ] из
 расчёта исключается с обеих сторон (иначе маркировка искусственно завысит WER).
 
+Для терминов предметной области (табл. 17 ТЗ: полнота ≥ 85 %, F1 ≥ 0,88)
+вычисляются Precision, Recall и F1 относительно эталонной расшифровки.
+
 DER считается по временным интервалам: доля времени с ошибкой (пропуск речи,
 ложное срабатывание, перепутанный спикер) относительно общего времени речи
-эталона — упрощённая реализация с collar 0.25 с (см. docs/metrics_protocol.md).
+эталона с защитной зоной collar = 0.25 с.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
 
+from .lexicon import count_term_occurrences
 from .models import UNKNOWN_SPEAKER
 
 _PUNCT_RE = re.compile(r"[.,!?;:\"'()\[\]«»…\-—–]")
+_NBZ_RE = re.compile(r"\[нбз\]", flags=re.IGNORECASE)
 
 
-def normalize(text: str) -> str:
-    """Нижний регистр, удаление метки [НБЗ] и пунктуации.
-
-    Метка удаляется до снятия пунктуации, иначе скобки «[]» разобьются на
-    отдельные токены. Пробелы схлопываются, чтобы не появлялись пустые слова.
-    """
-    t = re.sub(r"\[нбз\]", " ", text.lower(), flags=re.IGNORECASE)
+def normalize(text: str, *, lowercase: bool = True) -> str:
+    """Удаление метки [НБЗ], пунктуации и нормализация регистра/пробелов."""
+    t = _NBZ_RE.sub(" ", text)
+    if lowercase:
+        t = t.lower()
     t = _PUNCT_RE.sub(" ", t)
     return " ".join(t.split())
 
 
-def words(text: str) -> list[str]:
-    return normalize(text).split()
+def words(text: str, *, lowercase: bool = True) -> list[str]:
+    return normalize(text, lowercase=lowercase).split()
 
 
-def chars(text: str) -> list[str]:
-    return [c for c in normalize(text) if not c.isspace()]
+def chars(text: str, *, lowercase: bool = True) -> list[str]:
+    return [c for c in normalize(text, lowercase=lowercase) if not c.isspace()]
 
 
 def edit_distance(ref: list[str], hyp: list[str]) -> tuple[int, int, int, int]:
-    """Возвращает (расстояние, замены, удаления, вставки) по алгоритму Левенштейна
-    с бэктрейсингом. O(n*m), достаточно для фрагментов до нескольких тысяч слов.
-
-    Сравнение чувствительно к регистру: WER/CER считаются на словах как есть
-    (TTR-стиль); нормализация регистра — ответственность normalize().
-
-    При бэктрейсинге сначала проверяется diagonal (замена/совпадение), затем
-    удаление и вставка — иначе путь с заменой ошибочно разлагается на пару
-    «удаление + вставка» и статистика sub/ins искажается при равной стоимости.
-    """
+    """Возвращает (расстояние, замены, удаления, вставки) по алгоритму Левенштейна."""
     n, m = len(ref), len(hyp)
     d = [[0] * (m + 1) for _ in range(n + 1)]
     for i in range(n + 1):
@@ -58,10 +52,11 @@ def edit_distance(ref: list[str], hyp: list[str]) -> tuple[int, int, int, int]:
     for i in range(1, n + 1):
         for j in range(1, m + 1):
             cost = 0 if ref[i - 1] == hyp[j - 1] else 1
-            d[i][j] = min(d[i - 1][j] + 1,          # удаление
-                          d[i][j - 1] + 1,          # вставка
-                          d[i - 1][j - 1] + cost)   # замена/совпадение
-    # бэктрейсинг
+            d[i][j] = min(
+                d[i - 1][j] + 1,          # удаление
+                d[i][j - 1] + 1,          # вставка
+                d[i - 1][j - 1] + cost,   # замена/совпадение
+            )
     i, j = n, m
     sub = ins = dele = 0
     while i > 0 or j > 0:
@@ -81,46 +76,83 @@ def edit_distance(ref: list[str], hyp: list[str]) -> tuple[int, int, int, int]:
 @dataclass
 class ErrorRate:
     rate: float
-    errors: int
-    total: int
-    substitutions: int
-    deletions: int
-    insertions: int
+    errors: float
+    total: float
+    substitutions: float
+    deletions: float
+    insertions: float
 
 
-def wer(reference: str, hypothesis: str) -> ErrorRate:
-    # WER считается без нормализации регистра (TTR-стиль): normalize() ниже
-    # не вызывается, только удаление метки [НБЗ] и пунктуации.
-    r = _for_scoring(reference).split()
-    h = _for_scoring(hypothesis).split()
+@dataclass
+class TermMetrics:
+    """Метрики качества распознавания терминов предметной области (табл. 17 ТЗ)."""
+    precision: float
+    recall: float
+    f1: float
+    ref_occurrences: int
+    hyp_occurrences: int
+    true_positives: int
+    per_term: dict[str, dict[str, int]]
+
+
+def wer(reference: str, hypothesis: str, *, case_sensitive: bool = False) -> ErrorRate:
+    """Word Error Rate после нормализации регистра, пунктуации и меток [НБЗ]."""
+    r = words(reference, lowercase=not case_sensitive)
+    h = words(hypothesis, lowercase=not case_sensitive)
     dist, s, d_, i = edit_distance(r, h)
     total = len(r)
-    return ErrorRate(dist / total if total else 0.0, dist, total, s, d_, i)
+    return ErrorRate(dist / total if total else (1.0 if h else 0.0), dist, total, s, d_, i)
 
 
-def cer(reference: str, hypothesis: str) -> ErrorRate:
-    # CER — по символам исходного текста с учётом регистра (TTR-стиль);
-    # метка [НБЗ] вырезается целиком, чтобы маркировка не завышала CER.
-    r = _chars_raw(reference)
-    h = _chars_raw(hypothesis)
+def cer(reference: str, hypothesis: str, *, case_sensitive: bool = False) -> ErrorRate:
+    """Character Error Rate после нормализации регистра, пунктуации и меток [НБЗ]."""
+    r = chars(reference, lowercase=not case_sensitive)
+    h = chars(hypothesis, lowercase=not case_sensitive)
     dist, s, d_, i = edit_distance(r, h)
     total = len(r)
-    return ErrorRate(dist / total if total else 0.0, dist, total, s, d_, i)
+    return ErrorRate(dist / total if total else (1.0 if h else 0.0), dist, total, s, d_, i)
 
 
-_NBZ_RE = re.compile(r"\[нбз\]", flags=re.IGNORECASE)
+def term_f1(reference: str, hypothesis: str, terms: list[str]) -> TermMetrics:
+    """Вычисляет полноту (Recall), точность (Precision) и F1-меру по списку терминов (NFR-01).
 
+    Сопоставляет число вхождений каждого термина в эталонной и машинной расшифровках:
+      TP_t = min(count_ref(t), count_hyp(t))
+      Recall = sum(TP_t) / sum(count_ref(t))
+      Precision = sum(TP_t) / sum(count_hyp(t))
+      F1 = 2 * P * R / (P + R)
+    """
+    ref_total = 0
+    hyp_total = 0
+    tp_total = 0
+    per_term: dict[str, dict[str, int]] = {}
 
-def _for_scoring(text: str) -> str:
-    """Для WER: нижний регистр НЕ приводим; убираем только метку [НБЗ] и пунктуацию."""
-    t = _NBZ_RE.sub(" ", text)
-    t = _PUNCT_RE.sub(" ", t)
-    return " ".join(t.split())
+    for term in terms:
+        rc = count_term_occurrences(reference, term)
+        hc = count_term_occurrences(hypothesis, term)
+        tp = min(rc, hc)
+        ref_total += rc
+        hyp_total += hc
+        tp_total += tp
+        if rc > 0 or hc > 0:
+            per_term[term] = {"ref": rc, "hyp": hc, "tp": tp}
 
+    if ref_total == 0 and hyp_total == 0:
+        precision = recall = f1_val = 1.0
+    else:
+        precision = (tp_total / hyp_total) if hyp_total > 0 else 0.0
+        recall = (tp_total / ref_total) if ref_total > 0 else 1.0
+        f1_val = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
 
-def _chars_raw(text: str) -> list[str]:
-    t = _NBZ_RE.sub("", text)
-    return [c for c in t if not c.isspace()]
+    return TermMetrics(
+        precision=precision,
+        recall=recall,
+        f1=f1_val,
+        ref_occurrences=ref_total,
+        hyp_occurrences=hyp_total,
+        true_positives=tp_total,
+        per_term=per_term,
+    )
 
 
 # --- DER ---------------------------------------------------------------------
@@ -139,7 +171,6 @@ def _merge(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
 
 
 def _subtract(a: list[tuple[float, float]], b: list[tuple[float, float]]) -> list[tuple[float, float]]:
-    """Множественное вычитание интервалов: a \\ b (оба списка — любые, нормализуем сами)."""
     res: list[tuple[float, float]] = []
     b_m = _merge(b)
     for s, e in _merge(a):
@@ -164,7 +195,6 @@ def _total(intervals: list[tuple[float, float]]) -> float:
 
 
 def _overlap(a: list[tuple[float, float]], b: list[tuple[float, float]]) -> float:
-    """Суммарное время пересечения двух списков интервалов (линейный sweep)."""
     am, bm = _merge(a), _merge(b)
     i = j = 0
     acc = 0.0
@@ -180,11 +210,6 @@ def _overlap(a: list[tuple[float, float]], b: list[tuple[float, float]]) -> floa
 
 
 def _scored(segs: list[Interval], collar: float) -> list[tuple[float, float]]:
-    """Интервалы речи без «защитных зон» ±collar вокруг ГЛАВНЫХ границ сегментов.
-
-    Как в pyannote: из области оценки исключаются только границы самих сегментов
-    (каждого списка по отдельности), а не границы каждого спикера в отдельности.
-    """
     bounds = sorted({s for s, _, _ in segs} | {e for _, e, _ in segs})
     excl = [(max(0.0, b - collar), b + collar) for b in bounds]
     res: list[tuple[float, float]] = []
@@ -193,32 +218,13 @@ def _scored(segs: list[Interval], collar: float) -> list[tuple[float, float]]:
     return _merge(res)
 
 
-def _scored_intervals(intervals: list[tuple[float, float]],
-                      bounds: list[float], collar: float) -> list[tuple[float, float]]:
-    """То же, что _scored, но для плоского списка интервалов с явным списком
-    границ, вокруг которых вырезаются защитные зоны (нужно для confusion:
-    границы берём от ПОЛНОГО набора сегментов, а не от одного имени)."""
-    excl = [(max(0.0, b - collar), b + collar) for b in sorted(set(bounds))]
-    res: list[tuple[float, float]] = []
-    for s, e in intervals:
-        res.extend(_subtract([(s, e)], excl))
-    return _merge(res)
-
-
-def der(reference: list[Interval], hypothesis: list[Interval],
-        collar: float = 0.25, mapping: dict[str, str] | None = None) -> ErrorRate:
-    """DER по классической схеме md-eval.pl: доля времени речи эталона, где есть
-    пропуск (miss), ложное срабатывание (false alarm) или перепутанный спикер
-    (confusion).
-
-    mapping — соответствие имён «эталон -> гипотеза», которое проставляет
-    эксперт (или вызывающий код), когда подписи различаются («Алексей» против
-    SPEAKER_00). Без mapping имена сравниваются как есть: зеркальная путаница
-    A-B даст полный confusion, что и ожидается по смыслу DER.
-
-    collar (сек) вырезается вокруг границ сегментов с обеих сторон — стандартная
-    практика pyannote: точность самих границ зависит от VAD, а не от диаризации.
-    """
+def der(
+    reference: list[Interval],
+    hypothesis: list[Interval],
+    collar: float = 0.25,
+    mapping: dict[str, str] | None = None,
+) -> ErrorRate:
+    """DER по классической схеме md-eval.pl с collar 0.25 с."""
     ref_scored = _scored(reference, collar)
     hyp_scored = _scored(hypothesis, collar)
     total_ref = _total(ref_scored)
@@ -228,25 +234,25 @@ def der(reference: list[Interval], hypothesis: list[Interval],
     covered = _overlap(ref_scored, hyp_scored)
     miss = max(0.0, total_ref - covered)
     fa = max(0.0, _total(hyp_scored) - covered)
-
-    # confusion: покрытое время, на котором набор имён спикера различается.
     conf = min(_confusion_scored(reference, hypothesis, collar, mapping), covered)
 
     errors = miss + fa + conf
-    return ErrorRate(errors / total_ref, round(errors, 3), round(total_ref, 3),
-                     round(conf, 3), round(miss, 3), round(fa, 3))
+    return ErrorRate(
+        errors / total_ref,
+        round(errors, 3),
+        round(total_ref, 3),
+        round(conf, 3),
+        round(miss, 3),
+        round(fa, 3),
+    )
 
 
-def _confusion_scored(reference: list[Interval], hypothesis: list[Interval],
-                      collar: float, mapping: dict[str, str] | None) -> float:
-    """Покадровая confusion в scored-области (защитные зоны ±collar исключены).
-
-    Для каждого кадра собираем множества имён из ref и из hyp; если оба
-    непустые и не равны — кадр засчитан как ошибка со весом
-    (|ref| - |ref ∩ hyp|) / |ref|, т.е. долей неверных имён среди эталонных.
-    Гипотеза без диаризации (единственное UNKNOWN_SPEAKER) ошибок имён не даёт:
-    имена не путались, просто диаризация не выполнялась.
-    """
+def _confusion_scored(
+    reference: list[Interval],
+    hypothesis: list[Interval],
+    collar: float,
+    mapping: dict[str, str] | None,
+) -> float:
     hyp_names = {spk for _, _, spk in hypothesis}
     if hyp_names == {UNKNOWN_SPEAKER}:
         return 0.0
@@ -268,8 +274,12 @@ def _confusion_scored(reference: list[Interval], hypothesis: list[Interval],
             if 0 <= i < n:
                 hyp_map[i].add(nm)
 
-    bounds = sorted({s for s, _, _ in reference} | {e for _, e, _ in reference}
-                    | {s for s, _, _ in hypothesis} | {e for _, e, _ in hypothesis})
+    bounds = sorted(
+        {s for s, _, _ in reference}
+        | {e for _, e, _ in reference}
+        | {s for s, _, _ in hypothesis}
+        | {e for _, e, _ in hypothesis}
+    )
     excl = [(b - collar, b + collar) for b in bounds]
     conf = 0.0
     for k, (rf, hf) in enumerate(zip(ref_map, hyp_map)):
@@ -277,17 +287,7 @@ def _confusion_scored(reference: list[Interval], hypothesis: list[Interval],
             continue
         t = lo + (k + 0.5) * step
         if any(a <= t < b for a, b in excl):
-            continue  # кадр в защитной зоне границы — не оцениваем
+            continue
         shared = rf & hf
         conf += (len(rf) - len(shared)) / len(rf) * step
     return conf
-
-
-def _intersect(a: list[tuple[float, float]], b: list[tuple[float, float]]) -> list[tuple[float, float]]:
-    out: list[tuple[float, float]] = []
-    for s1, e1 in _merge(a):
-        for s2, e2 in _merge(b):
-            lo, hi = max(s1, s2), min(e1, e2)
-            if hi > lo:
-                out.append((lo, hi))
-    return _merge(out)
