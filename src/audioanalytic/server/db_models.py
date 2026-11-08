@@ -68,6 +68,7 @@ class Recording(Base):
     diarize_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     low_vram: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     pipeline_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="auto")
+    speed_preset: Mapped[str] = mapped_column(String(32), nullable=False, default="auto")
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

@@ -69,6 +69,7 @@ export const LibraryView: React.FC<Props> = ({
   const [speakers, setSpeakers] = useState("");
   const [diarize, setDiarize] = useState(true);
   const [priority, setPriority] = useState(2);
+  const [speedPreset, setSpeedPreset] = useState("auto");
   const [busy, setBusy] = useState(false);
 
   const pickFile = (picked: File | null) => {
@@ -90,6 +91,7 @@ export const LibraryView: React.FC<Props> = ({
       fd.append("priority", String(priority));
       if (speakers.trim()) fd.append("num_speakers", speakers.trim());
       fd.append("diarize", String(diarize));
+      fd.append("speed_preset", speedPreset);
       await api.uploadRecording(fd);
       setFile(null);
       setTitle("");
@@ -232,6 +234,18 @@ export const LibraryView: React.FC<Props> = ({
             {showOptions && (
               <div className="options-grid">
                 <div>
+                  <label className="field-label">Скорость и модель</label>
+                  <select
+                    className="select"
+                    value={speedPreset}
+                    onChange={(e) => setSpeedPreset(e.target.value)}
+                  >
+                    <option value="auto">Авто (быстро и точно)</option>
+                    <option value="fast">Максимальная скорость (small)</option>
+                    <option value="accurate">Максимум качества (large-v3)</option>
+                  </select>
+                </div>
+                <div>
                   <label className="field-label">Число спикеров</label>
                   <input
                     type="number"
@@ -339,12 +353,19 @@ export const LibraryView: React.FC<Props> = ({
                   </div>
 
                   {isRunning && (
-                    <div className="thin-progress" title={rec.stage_message}>
-                      <div
-                        className="thin-progress-bar"
-                        style={{ width: `${Math.max(4, Math.min(100, rec.progress_pct))}%` }}
-                      />
-                    </div>
+                    <>
+                      <div className="thin-progress" title={rec.stage_message}>
+                        <div
+                          className="thin-progress-bar"
+                          style={{ width: `${Math.max(4, Math.min(100, rec.progress_pct))}%` }}
+                        />
+                      </div>
+                      {rec.stage_message && (
+                        <div style={{ marginTop: "0.28rem", fontSize: "0.78rem", color: "var(--text-muted)" }}>
+                          {rec.stage_message}
+                        </div>
+                      )}
+                    </>
                   )}
 
                   {isFailed && rec.error_message && (

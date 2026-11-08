@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Generator
 
-from sqlalchemy import create_engine, event, select, text
+from sqlalchemy import create_engine, event, inspect, select, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -158,6 +158,16 @@ class DatabaseManager:
 
     def init_db(self) -> None:
         Base.metadata.create_all(bind=self.engine)
+        # Автоматическая миграция для уже существующих локальных баз пользователей
+        try:
+            cols = {c["name"] for c in inspect(self.engine).get_columns("recordings")}
+            if "speed_preset" not in cols:
+                with self.engine.begin() as conn:
+                    conn.execute(
+                        text("ALTER TABLE recordings ADD COLUMN speed_preset VARCHAR(32) NOT NULL DEFAULT 'auto'")
+                    )
+        except Exception:
+            pass
         if self.is_postgres:
             # Штатный полнотекстовый поиск СУБД PostgreSQL 15+ для русского языка (табл. 18, FR-08)
             with self.engine.begin() as conn:
