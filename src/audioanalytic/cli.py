@@ -50,6 +50,13 @@ def _cmd_transcribe(a: argparse.Namespace) -> int:
     )
     if a.model:
         cfg.model = a.model
+        cfg.explicit_model = True
+    if getattr(a, "fast", False):
+        cfg.speed_preset = "fast"
+        if not a.model:
+            cfg.model = "small"
+            cfg.explicit_model = True
+        cfg.beam_size = 1
     if getattr(a, "cpu", False):
         cfg.device = "cpu"
     if getattr(a, "max_duration", None) is not None:
@@ -280,6 +287,7 @@ def _cmd_check(a: argparse.Namespace) -> int:
         out=a.out,
         language="ru",
         model=a.model,
+        fast=False,
         low_vram=False,
         cpu=a.cpu,
         max_duration=a.max_duration,
@@ -393,7 +401,8 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("audio")
     t.add_argument("--out", default="out")
     t.add_argument("--language", default="ru")
-    t.add_argument("--model", help="например large-v3, large-v3-turbo")
+    t.add_argument("--model", help="например large-v3, large-v3-turbo, small")
+    t.add_argument("--fast", action="store_true", help="ускоренный режим (модель small, greedy декодер)")
     t.add_argument("--low-vram", action="store_true", help="профиль для GPU 8 ГБ")
     t.add_argument("--cpu", action="store_true", help="принудительно CPU (без CUDA)")
     t.add_argument("--max-duration", type=float, metavar="SEC", help="обработать только первые SEC секунд")

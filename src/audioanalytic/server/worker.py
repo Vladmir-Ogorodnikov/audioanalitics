@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from ..checkpoint import load_checkpoint
 from ..config import ServerSettings, SttConfig
+from ..model_cache import GLOBAL_MODEL_CACHE
 from ..models import Segment, Transcript
 from .audit import log_audit_event
 from .database import DatabaseManager
@@ -91,6 +92,7 @@ class QueueWorker:
         self._wake_event.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=timeout)
+        GLOBAL_MODEL_CACHE.clear()
 
     def notify(self) -> None:
         """Будит воркер при поступлении новой задачи в очередь."""
@@ -250,8 +252,11 @@ class QueueWorker:
 
             terms_path = self.settings.data_dir / "dictionaries" / "terms.txt"
             badwords_path = self.settings.data_dir / "dictionaries" / "badwords.txt"
-            make_cfg = SttConfig.low_vram if rec.low_vram else SttConfig
-            cfg = make_cfg(
+            preset = getattr(rec, "speed_preset", None) or "auto"
+            cfg = SttConfig.from_preset(
+                preset,
+                low_vram=bool(rec.low_vram),
+                keep_models_warm=not bool(rec.low_vram),
                 language=rec.language or "ru",
                 diarize=bool(rec.diarize_enabled),
                 num_speakers=rec.requested_speakers,
@@ -268,20 +273,26 @@ class QueueWorker:
 
         def _on_progress(msg: str) -> None:
             low = msg.lower()
-            pct = 15.0
+            pct = 18.0
             status = "transcribing"
             if "предобработк" in low:
                 pct, status = 12.0, "preprocessing"
+            elif "загрузка аудио" in low or "чтение" in low:
+                pct = 20.0
+            elif "подготовка модели" in low:
+                pct = 28.0
             elif "распознавание" in low or "демо-режим asr" in low:
-                pct = 35.0
+                pct = 40.0
             elif "часть " in low and "/" in low:
-                pct = 55.0
+                pct = 58.0
             elif "выравниван" in low:
-                pct = 72.0
+                pct = 74.0
             elif "диаризац" in low:
-                pct = 86.0
+                pct = 88.0
+            elif "постобработк" in low:
+                pct = 95.0
             elif "готово" in low:
-                pct = 98.0
+                pct = 99.0
             with self.db_manager.SessionLocal() as s_db:
                 r = s_db.get(Recording, rec_id)
                 if r is not None:
@@ -301,9 +312,11 @@ class QueueWorker:
             from ..winfix import allow_pyannote_unpickling
             allow_pyannote_unpickling()
             transcript: Transcript = run_whisperx(orig_path, cfg, progress=_on_progress)
-            engine_used = f"whisperx ({cfg.model})"
+            actual_model = str(transcript.meta.get("model_used") or cfg.model)
+            engine_used = f"whisperx ({actual_model})"
         else:
             transcript = simulate_transcription(orig_path, cfg, progress=_on_progress)
+            actual_model = cfg.model
             engine_used = "demo-simulator (ffmpeg + чекпоинты + словари)"
 
         turns = merge_segments_to_utterances(transcript.segments)
@@ -335,7 +348,7 @@ class QueueWorker:
             tr_row = TranscriptRecord(
                 recording_id=rec.id,
                 language=transcript.language,
-                model_name=cfg.model,
+                model_name=actual_model,
                 engine_used=engine_used,
                 full_text=full_text,
                 word_count=word_count,
@@ -397,5 +410,6 @@ class QueueWorker:
             except Exception:
                 log.exception("Непредвиденная ошибка цикла воркера")
             if not processed:
+                GLOBAL_MODEL_CACHE.evict_if_idle(self.settings.model_cache_idle_sec)
                 self._wake_event.wait(timeout=1.5)
                 self._wake_event.clear()

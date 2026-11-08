@@ -72,6 +72,7 @@ class RecordingDetailOut(RecordingSummaryItem):
     diarize_enabled: bool
     low_vram: bool
     pipeline_mode: str
+    speed_preset: str = "auto"
     checkpoint_history: list[dict[str, Any]] = Field(default_factory=list)
     transcript: TranscriptOut | None = None
 

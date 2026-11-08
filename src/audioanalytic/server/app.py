@@ -257,6 +257,7 @@ def create_app(
         diarize: bool = Form(default=True),
         low_vram: bool = Form(default=False),
         pipeline_mode: str = Form(default="auto"),
+        speed_preset: str = Form(default="auto"),
         db: Session = Depends(get_db),
     ) -> RecordingSummaryItem:
         orig_name = Path(file.filename or "recording.wav").name
@@ -320,6 +321,7 @@ def create_app(
             diarize_enabled=diarize,
             low_vram=low_vram,
             pipeline_mode=pipeline_mode if pipeline_mode in ("auto", "whisperx", "demo") else "auto",
+            speed_preset=speed_preset if speed_preset in ("auto", "fast", "balanced", "accurate") else "auto",
         )
         db.add(rec)
         db.flush()
@@ -502,6 +504,7 @@ def create_app(
             diarize_enabled=rec.diarize_enabled,
             low_vram=rec.low_vram,
             pipeline_mode=rec.pipeline_mode,
+            speed_preset=getattr(rec, "speed_preset", "auto") or "auto",
             checkpoint_history=ckpt_history,
             transcript=tr_out,
         )
