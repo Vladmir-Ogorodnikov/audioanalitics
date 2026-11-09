@@ -66,6 +66,38 @@ class RecordingSummaryItem(BaseModel):
     matched_timecode_sec: float | None = None
 
 
+class KeyConceptOut(BaseModel):
+    term: str
+    definition: str
+
+
+class ThesisOut(BaseModel):
+    id: int
+    seq_num: int
+    text: str
+    timecode_sec: float
+    timecode_formatted: str
+    confidence: float
+    needs_review: bool
+
+
+class SummaryOut(BaseModel):
+    id: int
+    model_name: str
+    goal: str
+    key_concepts: list[KeyConceptOut] = Field(default_factory=list)
+    theses: list[ThesisOut] = Field(default_factory=list)
+    tasks_decisions: list[str] = Field(default_factory=list)
+    self_check_questions: list[str] = Field(default_factory=list)
+    entities: dict[str, list[str]] = Field(default_factory=dict)
+    updated_at: datetime | None = None
+
+
+class SummarizeRequest(BaseModel):
+    model: str | None = None
+    require_llm: bool = False
+
+
 class RecordingDetailOut(RecordingSummaryItem):
     language: str
     requested_speakers: int | None = None
@@ -75,6 +107,7 @@ class RecordingDetailOut(RecordingSummaryItem):
     speed_preset: str = "auto"
     checkpoint_history: list[dict[str, Any]] = Field(default_factory=list)
     transcript: TranscriptOut | None = None
+    summary: SummaryOut | None = None
 
 
 class SpeakerRenameRequest(BaseModel):

@@ -13,11 +13,13 @@ from sqlalchemy.orm import Session
 
 from ..checkpoint import load_checkpoint
 from ..config import ServerSettings, SttConfig
-from ..model_cache import GLOBAL_MODEL_CACHE
+from ..lexicon import load_terms
+from ..model_cache import GLOBAL_MODEL_CACHE, has_ample_vram
 from ..models import Segment, Transcript
+from ..summarizer import SummaryData, generate_summary_for_turns
 from .audit import log_audit_event
 from .database import DatabaseManager
-from .db_models import Recording, TranscriptRecord, Utterance
+from .db_models import Recording, Summary, Thesis, TranscriptRecord, Utterance
 from .demo_audio import simulate_transcription, whisperx_available
 
 log = logging.getLogger(__name__)
@@ -62,6 +64,43 @@ def merge_segments_to_utterances(
                 "words": seg_words,
             })
     return turns
+
+
+def persist_summary(db: Session, recording_id: int, data: SummaryData) -> Summary:
+    """Сохраняет или обновляет сущность Summary и привязанные к таймкодам Thesis в БД."""
+    rec = db.get(Recording, recording_id)
+    if rec is not None and rec.summary is not None:
+        db.delete(rec.summary)
+        db.flush()
+
+    sum_row = Summary(
+        recording_id=recording_id,
+        model_name=data.model_name,
+        goal=data.goal,
+        key_concepts_json=json.dumps(data.key_concepts, ensure_ascii=False),
+        tasks_decisions_json=json.dumps(data.tasks_decisions, ensure_ascii=False),
+        self_check_questions_json=json.dumps(data.self_check_questions, ensure_ascii=False),
+        entities_json=json.dumps(data.entities, ensure_ascii=False),
+        search_text=data.build_search_text(),
+    )
+    db.add(sum_row)
+    db.flush()
+
+    for th in data.theses:
+        db.add(
+            Thesis(
+                summary_id=sum_row.id,
+                seq_num=th.seq_num,
+                section="key_theses",
+                text=th.text,
+                timecode_sec=th.timecode_sec,
+                timecode_formatted=th.timecode_formatted,
+                confidence=th.confidence,
+                needs_review=th.needs_review,
+            )
+        )
+    db.flush()
+    return sum_row
 
 
 class QueueWorker:
@@ -322,6 +361,31 @@ class QueueWorker:
         turns = merge_segments_to_utterances(transcript.segments)
         full_text = "\n".join(f"{u['speaker']}: {u['text']}" for u in turns)
         word_count = sum(len(u["text"].split()) for u in turns)
+
+        # Спринт 2 (FR-05, FR-06): генерация структурированного конспекта через локальную LLM (или резервный контур)
+        summary_data: SummaryData | None = None
+        if self.settings.auto_summarize and turns:
+            with self.db_manager.SessionLocal() as s_db:
+                r = s_db.get(Recording, rec_id)
+                rec_title = r.title if r else orig_path.stem
+                if r is not None:
+                    r.status = "analyzing"
+                    r.progress_pct = max(r.progress_pct or 0.0, 94.0)
+                    r.stage_message = f"Формирование конспекта ({self.settings.llm.model})…"
+                    s_db.commit()
+
+            # На GPU ≤ 8 ГБ освобождаем кэш STT перед обращением к локальной LLM (CON-03)
+            if cfg.keep_models_warm is False or not has_ample_vram(10.0):
+                GLOBAL_MODEL_CACHE.clear()
+
+            known_terms = load_terms(terms_path) if terms_path.is_file() else []
+            summary_data = generate_summary_for_turns(
+                turns,
+                title=rec_title,
+                cfg=self.settings.llm,
+                known_terms=known_terms,
+            )
+
         elapsed = round(time.monotonic() - t0, 2)
 
         # Обновляем параметры подготовленного файла (16 кГц, моно)
@@ -375,13 +439,20 @@ class QueueWorker:
                     )
                 )
 
+            if summary_data is not None:
+                persist_summary(db, rec.id, summary_data)
+
             rec.duration_sec = round(prep_dur, 2)
             rec.sample_rate = prep_sr
             rec.channels = prep_ch
             rec.status = "completed"
             rec.progress_pct = 100.0
             rec.checkpoint_stage = "completed"
-            rec.stage_message = "Транскрибация и диаризация завершены"
+            rec.stage_message = (
+                "Транскрибация и конспект готовы"
+                if summary_data is not None
+                else "Транскрибация и диаризация завершены"
+            )
             rec.completed_at = datetime.now(timezone.utc)
             rec.processing_time_sec = elapsed
 
@@ -396,6 +467,7 @@ class QueueWorker:
                     "word_count": word_count,
                     "censored_count": tr_row.censored_count,
                     "engine": engine_used,
+                    "summary_model": summary_data.model_name if summary_data else None,
                     "processing_time_sec": elapsed,
                 },
                 commit=False,

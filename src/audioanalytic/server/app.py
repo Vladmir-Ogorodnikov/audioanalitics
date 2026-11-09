@@ -19,7 +19,8 @@ from sqlalchemy import func, or_, select, text
 from sqlalchemy.orm import Session
 
 from ..checkpoint import load_checkpoint
-from ..config import ServerSettings
+from ..config import LlmConfig, ServerSettings
+from ..exporters import build_docx_bytes, build_markdown, build_srt, build_txt
 from ..formatting import fmt_ts
 from ..lexicon import (
     DEFAULT_PROFANITY_ROOTS,
@@ -32,6 +33,7 @@ from ..lexicon import (
 from ..metrics import cer, term_f1, wer
 from ..models import Segment, Word
 from ..preprocess import probe_audio
+from ..summarizer import generate_summary_for_turns, probe_llm_service
 from ..winfix import find_ffmpeg, free_gb
 from .audit import (
     cleanup_expired_audit_logs,
@@ -50,17 +52,21 @@ from .db_models import (
 )
 from .demo_audio import generate_demo_lecture_wav, whisperx_available
 from .schemas import (
+    KeyConceptOut,
     LexiconPayload,
     MetricsEvaluateRequest,
     RecordingDetailOut,
     RecordingSummaryItem,
     SpeakerRenameRequest,
+    SummarizeRequest,
+    SummaryOut,
+    ThesisOut,
     TranscriptOut,
     UtteranceOut,
     UtteranceUpdateRequest,
     WordOut,
 )
-from .worker import QueueWorker
+from .worker import QueueWorker, persist_summary
 
 ALLOWED_AUDIO_EXT = {".mp3", ".wav", ".flac"}
 UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1 МБ потоковая запись (FR-01)
@@ -133,6 +139,56 @@ def _interpolate_words(text_val: str, start_sec: float, end_sec: float) -> list[
     return out
 
 
+def _build_summary_out(s: Summary | None) -> SummaryOut | None:
+    if s is None:
+        return None
+    try:
+        raw_concepts = json.loads(s.key_concepts_json or "[]")
+    except Exception:
+        raw_concepts = []
+    try:
+        raw_tasks = json.loads(s.tasks_decisions_json or "[]")
+    except Exception:
+        raw_tasks = []
+    try:
+        raw_questions = json.loads(s.self_check_questions_json or "[]")
+    except Exception:
+        raw_questions = []
+    try:
+        raw_entities = json.loads(s.entities_json or "{}")
+    except Exception:
+        raw_entities = {}
+
+    concepts = [
+        KeyConceptOut(term=str(c.get("term", "")), definition=str(c.get("definition", "")))
+        for c in raw_concepts
+        if isinstance(c, dict) and c.get("term")
+    ]
+    theses = [
+        ThesisOut(
+            id=th.id,
+            seq_num=th.seq_num,
+            text=th.text,
+            timecode_sec=th.timecode_sec,
+            timecode_formatted=th.timecode_formatted,
+            confidence=th.confidence,
+            needs_review=th.needs_review,
+        )
+        for th in s.theses
+    ]
+    return SummaryOut(
+        id=s.id,
+        model_name=s.model_name,
+        goal=s.goal,
+        key_concepts=concepts,
+        theses=theses,
+        tasks_decisions=[str(x) for x in raw_tasks if x],
+        self_check_questions=[str(x) for x in raw_questions if x],
+        entities={str(k): [str(v) for v in vals] for k, vals in raw_entities.items() if isinstance(vals, list)},
+        updated_at=s.updated_at,
+    )
+
+
 def create_app(
     settings: ServerSettings | None = None,
     *,
@@ -161,7 +217,7 @@ def create_app(
             "Локальная автоматизированная система транскрибации, диаризации и анализа "
             "академических аудиозаписей (ГОСТ 34.602-2020, шифр темы ААИИ-2026-01)."
         ),
-        version="0.2.0",
+        version="0.3.0",
         lifespan=lifespan,
     )
     app.openapi_version = "3.0.3"
@@ -186,7 +242,7 @@ def create_app(
 
     @app.get("/api/v1/health", tags=["Мониторинг"])
     def healthcheck() -> dict[str, str]:
-        return {"status": "ok", "version": "0.2.0"}
+        return {"status": "ok", "version": "0.3.0"}
 
     @app.get("/api/v1/system/status", tags=["Мониторинг"])
     def system_status(db: Session = Depends(get_db)) -> dict[str, Any]:
@@ -200,7 +256,7 @@ def create_app(
         )
         ff = find_ffmpeg()
         return {
-            "version": "0.2.0",
+            "version": "0.3.0",
             "database_dialect": db_manager.engine.dialect.name,
             "data_dir": str(cfg.data_dir),
             "disk_free_gb": round(free_gb(cfg.data_dir) or 0.0, 2),
@@ -217,6 +273,7 @@ def create_app(
             },
             "whisperx_installed": whisperx_available(),
             "gpu": _gpu_status(),
+            "llm": probe_llm_service(cfg.llm, timeout=1.2),
             "queue": queue_info,
             "stats": {
                 "total_recordings": total_recordings,
@@ -454,6 +511,15 @@ def create_app(
                         snippet = f"[{fmt_ts(u.start_sec)}] {u.speaker}: {u.text}"
                         matched_tc = u.start_sec
                         break
+            if query_str and snippet is None and r.summary is not None:
+                q_norm = query_str.lower()
+                for th in r.summary.theses:
+                    if q_norm in th.text.lower() or any(
+                        tok in th.text.lower() for tok in q_norm.split() if len(tok) >= 4
+                    ):
+                        snippet = f"{th.timecode_formatted} Тезис: {th.text}"
+                        matched_tc = th.timecode_sec
+                        break
             out.append(
                 _to_summary_item(
                     r,
@@ -507,6 +573,7 @@ def create_app(
             speed_preset=getattr(rec, "speed_preset", "auto") or "auto",
             checkpoint_history=ckpt_history,
             transcript=tr_out,
+            summary=_build_summary_out(rec.summary),
         )
 
     @app.get("/api/v1/recordings/{recording_id}/audio", tags=["Записи"])
@@ -712,11 +779,85 @@ def create_app(
 
         return _build_utterance_out(u)
 
+    @app.get("/api/v1/recordings/{recording_id}/summary", response_model=SummaryOut, tags=["Конспект (Спринт 2)"])
+    def get_recording_summary(recording_id: int, db: Session = Depends(get_db)) -> SummaryOut:
+        rec = db.get(Recording, recording_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail="Запись не найдена.")
+        out = _build_summary_out(rec.summary)
+        if out is None:
+            raise HTTPException(status_code=404, detail="Конспект для этой записи ещё не сформирован.")
+        return out
+
+    @app.post("/api/v1/recordings/{recording_id}/summarize", response_model=SummaryOut, tags=["Конспект (Спринт 2)"])
+    def summarize_recording(
+        recording_id: int,
+        request: Request,
+        payload: SummarizeRequest | None = None,
+        db: Session = Depends(get_db),
+    ) -> SummaryOut:
+        rec = db.get(Recording, recording_id)
+        if rec is None or rec.transcript is None:
+            raise HTTPException(status_code=404, detail="Запись или её расшифровка не найдена.")
+
+        turns = [
+            {
+                "start_sec": u.start_sec,
+                "end_sec": u.end_sec,
+                "speaker": u.speaker,
+                "text": u.text,
+            }
+            for u in rec.transcript.utterances
+        ]
+        llm_cfg = LlmConfig(
+            base_url=cfg.llm.base_url,
+            model=(payload.model.strip() if (payload and payload.model and payload.model.strip()) else cfg.llm.model),
+            api_key=cfg.llm.api_key,
+            timeout_sec=cfg.llm.timeout_sec,
+            max_chunk_chars=cfg.llm.max_chunk_chars,
+            temperature=cfg.llm.temperature,
+        )
+        terms_path = cfg.data_dir / "dictionaries" / "terms.txt"
+        known_terms = load_terms(terms_path) if terms_path.is_file() else []
+
+        try:
+            summary_data = generate_summary_for_turns(
+                turns,
+                title=rec.title,
+                cfg=llm_cfg,
+                known_terms=known_terms,
+                require_llm=bool(payload and payload.require_llm),
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Не удалось сформировать конспект через LLM: {exc}") from exc
+
+        sum_row = persist_summary(db, rec.id, summary_data)
+        log_audit_event(
+            db,
+            "summarize",
+            f"Сформирован конспект записи #{rec.id} «{rec.title}» (модель: {summary_data.model_name}, тезисов: {len(summary_data.theses)})",
+            entity_type="recording",
+            entity_id=rec.id,
+            details={
+                "model": summary_data.model_name,
+                "localhost_only": llm_cfg.is_localhost,
+                "used_fallback": summary_data.used_fallback,
+                "theses_count": len(summary_data.theses),
+            },
+            client_ip=_client_ip(request),
+            commit=False,
+        )
+        db.commit()
+        db.refresh(sum_row)
+        out = _build_summary_out(sum_row)
+        assert out is not None
+        return out
+
     @app.get("/api/v1/recordings/{recording_id}/export", tags=["Транскрипт и спикеры"])
     def export_recording(
         recording_id: int,
         request: Request,
-        format: str = Query(default="txt", pattern="^(txt|json)$"),
+        format: str = Query(default="txt", pattern="^(txt|json|md|docx|srt)$"),
         db: Session = Depends(get_db),
     ) -> Response:
         rec = db.get(Recording, recording_id)
@@ -726,11 +867,14 @@ def create_app(
         tr = rec.transcript
         safe_stem = "".join(c if c.isalnum() or c in "-_ " else "_" for c in rec.title).strip() or f"recording_{rec.id}"
         encoded_name = urllib.parse.quote(f"{safe_stem}.{format}")
+        utt_dicts = [_build_utterance_out(u).model_dump() for u in tr.utterances]
+        sum_out = _build_summary_out(rec.summary)
+        sum_dict = sum_out.model_dump(mode="json") if sum_out is not None else None
 
         log_audit_event(
             db,
             "export",
-            f"Экспорт транскрипта записи #{rec.id} в формат {format.upper()}",
+            f"Экспорт материалов записи #{rec.id} в формат {format.upper()}",
             entity_type="recording",
             entity_id=rec.id,
             details={"format": format},
@@ -744,7 +888,8 @@ def create_app(
                 "title": rec.title,
                 "duration_sec": rec.duration_sec,
                 "language": tr.language,
-                "utterances": [_build_utterance_out(u).model_dump() for u in tr.utterances],
+                "summary": sum_dict,
+                "utterances": utt_dicts,
             }
             return Response(
                 content=json.dumps(payload, ensure_ascii=False, indent=2),
@@ -752,15 +897,49 @@ def create_app(
                 headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}"},
             )
 
-        lines = [
-            f"АС «АудиоАналитик ИИ» — Расшифровка записи: {rec.title}",
-            f"Длительность: {fmt_ts(rec.duration_sec)} | Слов: {tr.word_count}",
-            "=" * 72,
-            "",
-        ]
-        for u in tr.utterances:
-            lines.append(f"[{fmt_ts(u.start_sec)}] {u.speaker}: {u.text}")
-        txt_body = "\n".join(lines) + "\n"
+        if format == "md":
+            md_body = build_markdown(
+                title=rec.title,
+                duration_sec=rec.duration_sec,
+                word_count=tr.word_count,
+                utterances=utt_dicts,
+                summary=sum_dict,
+            )
+            return Response(
+                content=md_body.encode("utf-8"),
+                media_type="text/markdown; charset=utf-8",
+                headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}"},
+            )
+
+        if format == "docx":
+            docx_bytes = build_docx_bytes(
+                title=rec.title,
+                duration_sec=rec.duration_sec,
+                word_count=tr.word_count,
+                utterances=utt_dicts,
+                summary=sum_dict,
+            )
+            return Response(
+                content=docx_bytes,
+                media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}"},
+            )
+
+        if format == "srt":
+            srt_body = build_srt(utt_dicts)
+            return PlainTextResponse(
+                content=srt_body,
+                media_type="text/plain; charset=utf-8",
+                headers={"Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}"},
+            )
+
+        txt_body = build_txt(
+            title=rec.title,
+            duration_sec=rec.duration_sec,
+            word_count=tr.word_count,
+            utterances=utt_dicts,
+            summary=sum_dict,
+        )
         return PlainTextResponse(
             content=txt_body,
             media_type="text/plain; charset=utf-8",

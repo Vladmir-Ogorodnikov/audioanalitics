@@ -1,6 +1,7 @@
 import type {
   RecordingDetail,
   RecordingSummary,
+  SummaryData,
   UtteranceItem,
 } from "./types";
 
@@ -72,5 +73,12 @@ export const api = {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text, speaker, apply_censor: true }),
+    }),
+
+  summarizeRecording: (recordingId: number) =>
+    requestJson<SummaryData>(`/api/v1/recordings/${recordingId}/summarize`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
     }),
 };

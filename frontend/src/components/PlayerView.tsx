@@ -36,6 +36,8 @@ export const PlayerView: React.FC<Props> = ({
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(recording.duration_sec || 0);
   const [rate, setRate] = useState(1);
+  const [activePane, setActivePane] = useState<"transcript" | "summary">("transcript");
+  const [summarizing, setSummarizing] = useState(false);
 
   // Редактирование реплики
   const [editingId, setEditingId] = useState<number | null>(null);
@@ -126,8 +128,34 @@ export const PlayerView: React.FC<Props> = ({
     }
   };
 
+  const handleRegenerateSummary = async () => {
+    setSummarizing(true);
+    try {
+      await api.summarizeRecording(recording.id);
+      onNotify("Конспект обновлён.");
+      onReload();
+    } catch (err) {
+      onError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSummarizing(false);
+    }
+  };
+
   const tr = recording.transcript;
+  const summary = recording.summary;
   const totalSec = Math.max(duration, recording.duration_sec || 0, 0.1);
+
+  const entityChips: string[] = [];
+  if (summary?.entities) {
+    for (const k of ["terms", "persons", "dates"]) {
+      const vals = summary.entities[k];
+      if (Array.isArray(vals)) {
+        for (const v of vals) {
+          if (v && !entityChips.includes(v)) entityChips.push(v);
+        }
+      }
+    }
+  }
 
   return (
     <div>
@@ -145,13 +173,34 @@ export const PlayerView: React.FC<Props> = ({
           </div>
         </div>
 
-        <div style={{ display: "flex", gap: "0.45rem" }}>
+        <div style={{ display: "flex", gap: "0.4rem", flexWrap: "wrap" }}>
           <a
             className="btn btn-primary btn-sm"
+            href={`/api/v1/recordings/${recording.id}/export?format=docx`}
+            download
+          >
+            DOCX
+          </a>
+          <a
+            className="btn btn-ghost btn-sm"
+            href={`/api/v1/recordings/${recording.id}/export?format=md`}
+            download
+          >
+            MD
+          </a>
+          <a
+            className="btn btn-ghost btn-sm"
             href={`/api/v1/recordings/${recording.id}/export?format=txt`}
             download
           >
-            Скачать TXT
+            TXT
+          </a>
+          <a
+            className="btn btn-ghost btn-sm"
+            href={`/api/v1/recordings/${recording.id}/export?format=srt`}
+            download
+          >
+            SRT
           </a>
           <a
             className="btn btn-ghost btn-sm"
@@ -216,145 +265,297 @@ export const PlayerView: React.FC<Props> = ({
         </div>
       </div>
 
-      {/* Компактная полоска переименования спикеров */}
-      {tr && tr.speakers.length > 0 && (
-        <div className="speakers-strip">
-          {tr.speakers.map((sp) =>
-            renamingSpeaker === sp ? (
-              <form key={sp} onSubmit={submitSpeakerRename} className="speaker-rename-inline">
-                <input
-                  type="text"
-                  autoFocus
-                  value={renameVal}
-                  placeholder="Имя спикера"
-                  onChange={(e) => setRenameVal(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Escape") setRenamingSpeaker(null);
-                  }}
-                />
-                <button type="submit" className="btn btn-primary btn-sm" style={{ borderRadius: "999px", padding: "0.18rem 0.6rem" }}>
-                  ОК
-                </button>
+      {/* Переключатель: Расшифровка / Конспект */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "0.75rem" }}>
+        <div className="view-switcher" role="tablist">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activePane === "transcript"}
+            className={`view-tab ${activePane === "transcript" ? "active" : ""}`}
+            onClick={() => setActivePane("transcript")}
+          >
+            Расшифровка
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activePane === "summary"}
+            className={`view-tab ${activePane === "summary" ? "active" : ""}`}
+            onClick={() => setActivePane("summary")}
+          >
+            Конспект
+          </button>
+        </div>
+
+        {/* Полоска спикеров показывается только в режиме Расшифровки */}
+        {activePane === "transcript" && tr && tr.speakers.length > 0 && (
+          <div className="speakers-strip" style={{ marginBottom: "1.15rem" }}>
+            {tr.speakers.map((sp) =>
+              renamingSpeaker === sp ? (
+                <form key={sp} onSubmit={submitSpeakerRename} className="speaker-rename-inline">
+                  <input
+                    type="text"
+                    autoFocus
+                    value={renameVal}
+                    placeholder="Имя спикера"
+                    onChange={(e) => setRenameVal(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Escape") setRenamingSpeaker(null);
+                    }}
+                  />
+                  <button type="submit" className="btn btn-primary btn-sm" style={{ borderRadius: "999px", padding: "0.18rem 0.6rem" }}>
+                    ОК
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-text btn-sm"
+                    style={{ borderRadius: "999px", padding: "0.18rem 0.45rem" }}
+                    onClick={() => setRenamingSpeaker(null)}
+                  >
+                    ✕
+                  </button>
+                </form>
+              ) : (
                 <button
+                  key={sp}
                   type="button"
-                  className="btn btn-text btn-sm"
-                  style={{ borderRadius: "999px", padding: "0.18rem 0.45rem" }}
-                  onClick={() => setRenamingSpeaker(null)}
+                  className="speaker-pill"
+                  title="Нажмите, чтобы переименовать спикера"
+                  onClick={() => {
+                    setRenamingSpeaker(sp);
+                    setRenameVal(sp);
+                  }}
                 >
-                  ✕
+                  <span>{sp}</span>
+                  <span style={{ opacity: 0.45 }}>✎</span>
                 </button>
-              </form>
-            ) : (
-              <button
-                key={sp}
-                type="button"
-                className="speaker-pill"
-                title="Нажмите, чтобы переименовать спикера"
-                onClick={() => {
-                  setRenamingSpeaker(sp);
-                  setRenameVal(sp);
-                }}
-              >
-                <span>{sp}</span>
-                <span style={{ opacity: 0.45 }}>✎</span>
-              </button>
-            )
-          )}
-        </div>
-      )}
+              )
+            )}
+          </div>
+        )}
+      </div>
 
-      {/* Поток реплик транскрипта */}
-      {!tr ? (
-        <div className="library-surface">
-          <div className="empty-state">Расшифровка ещё выполняется…</div>
-        </div>
-      ) : (
-        <div className="transcript-stream">
-          {tr.utterances.map((u) => {
-            const isActive = currentTime >= u.start_sec && currentTime <= u.end_sec + 0.15;
-            const isEditing = editingId === u.id;
+      {/* Режим 1: Поток реплик транскрипта */}
+      {activePane === "transcript" ? (
+        !tr ? (
+          <div className="library-surface">
+            <div className="empty-state">Расшифровка ещё выполняется…</div>
+          </div>
+        ) : (
+          <div className="transcript-stream">
+            {tr.utterances.map((u) => {
+              const isActive = currentTime >= u.start_sec && currentTime <= u.end_sec + 0.15;
+              const isEditing = editingId === u.id;
 
-            return (
-              <div key={u.id} className={`turn-block ${isActive ? "active" : ""}`}>
-                <div className="turn-header">
-                  <div className="turn-meta">
-                    <button
-                      type="button"
-                      className="timecode-btn"
-                      onClick={() => seekTo(u.start_sec)}
-                      title="Перейти к началу реплики"
-                    >
-                      {fmtClock(u.start_sec)}
-                    </button>
-                    <span className="turn-speaker">{u.speaker}</span>
-                    {u.is_edited && <span className="edited-dot">· изменено</span>}
+              return (
+                <div key={u.id} className={`turn-block ${isActive ? "active" : ""}`}>
+                  <div className="turn-header">
+                    <div className="turn-meta">
+                      <button
+                        type="button"
+                        className="timecode-btn"
+                        onClick={() => seekTo(u.start_sec)}
+                        title="Перейти к началу реплики"
+                      >
+                        {fmtClock(u.start_sec)}
+                      </button>
+                      <span className="turn-speaker">{u.speaker}</span>
+                      {u.is_edited && <span className="edited-dot">· изменено</span>}
+                    </div>
+
+                    {!isEditing && (
+                      <button
+                        type="button"
+                        className="btn btn-text btn-sm turn-edit-trigger"
+                        onClick={() => startEdit(u)}
+                      >
+                        Изменить
+                      </button>
+                    )}
                   </div>
 
-                  {!isEditing && (
-                    <button
-                      type="button"
-                      className="btn btn-text btn-sm turn-edit-trigger"
-                      onClick={() => startEdit(u)}
-                    >
-                      Изменить
-                    </button>
+                  {isEditing ? (
+                    <div style={{ display: "flex", flexDirection: "column", gap: "0.55rem", marginTop: "0.35rem" }}>
+                      <input
+                        type="text"
+                        className="input"
+                        style={{ maxWidth: "240px" }}
+                        placeholder="Спикер"
+                        value={editSpeaker}
+                        onChange={(e) => setEditSpeaker(e.target.value)}
+                      />
+                      <textarea
+                        rows={3}
+                        className="textarea"
+                        value={editText}
+                        onChange={(e) => setEditText(e.target.value)}
+                      />
+                      <div style={{ display: "flex", gap: "0.45rem" }}>
+                        <button type="button" className="btn btn-primary btn-sm" onClick={() => saveEdit(u)}>
+                          Сохранить
+                        </button>
+                        <button type="button" className="btn btn-ghost btn-sm" onClick={() => setEditingId(null)}>
+                          Отмена
+                        </button>
+                      </div>
+                    </div>
+                  ) : u.words && u.words.length > 0 ? (
+                    <div className="turn-words">
+                      {u.words.map((w, idx) => {
+                        const isSpoken =
+                          w.start !== null &&
+                          w.end !== null &&
+                          currentTime >= w.start &&
+                          currentTime <= w.end + 0.08;
+                        const isNbz = w.text.includes("[НБЗ]");
+                        return (
+                          <React.Fragment key={`${u.id}-${idx}`}>
+                            <button
+                              type="button"
+                              className={`word-token ${isSpoken ? "spoken" : ""} ${isNbz ? "censored" : ""}`}
+                              onClick={() => seekTo(w.start ?? u.start_sec)}
+                            >
+                              {w.text}
+                            </button>{" "}
+                          </React.Fragment>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <div className="turn-words">{u.text}</div>
                   )}
                 </div>
+              );
+            })}
+          </div>
+        )
+      ) : (
+        /* Режим 2: Структурированный конспект лекции (5 разделов ТЗ + таймкоды FR-06) */
+        !summary ? (
+          <div className="library-surface">
+            <div className="empty-state" style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "0.85rem" }}>
+              <span>Конспект для этой записи ещё не создан.</span>
+              {tr && (
+                <button
+                  type="button"
+                  className="btn btn-primary btn-sm"
+                  disabled={summarizing}
+                  onClick={handleRegenerateSummary}
+                >
+                  {summarizing ? "Формирование конспекта…" : "Сформировать конспект"}
+                </button>
+              )}
+            </div>
+          </div>
+        ) : (
+          <div className="summary-surface">
+            {/* 1. Цель занятия */}
+            <section>
+              <h3 className="summary-section-title">Цель и тема занятия</h3>
+              <p className="summary-goal">{summary.goal}</p>
+            </section>
 
-                {isEditing ? (
-                  <div style={{ display: "flex", flexDirection: "column", gap: "0.55rem", marginTop: "0.35rem" }}>
-                    <input
-                      type="text"
-                      className="input"
-                      style={{ maxWidth: "240px" }}
-                      placeholder="Спикер"
-                      value={editSpeaker}
-                      onChange={(e) => setEditSpeaker(e.target.value)}
-                    />
-                    <textarea
-                      rows={3}
-                      className="textarea"
-                      value={editText}
-                      onChange={(e) => setEditText(e.target.value)}
-                    />
-                    <div style={{ display: "flex", gap: "0.45rem" }}>
-                      <button type="button" className="btn btn-primary btn-sm" onClick={() => saveEdit(u)}>
-                        Сохранить
+            {/* 2. Основные тезисы с кликабельными таймкодами */}
+            {summary.theses.length > 0 && (
+              <section>
+                <h3 className="summary-section-title">Основные тезисы</h3>
+                <ul className="summary-list">
+                  {summary.theses.map((th) => (
+                    <li key={th.id} className="thesis-row">
+                      <button
+                        type="button"
+                        className="timecode-btn"
+                        onClick={() => seekTo(th.timecode_sec)}
+                        title="Перейти к этому моменту в аудиозаписи"
+                      >
+                        {fmtClock(th.timecode_sec)}
                       </button>
-                      <button type="button" className="btn btn-ghost btn-sm" onClick={() => setEditingId(null)}>
-                        Отмена
-                      </button>
-                    </div>
-                  </div>
-                ) : u.words && u.words.length > 0 ? (
-                  <div className="turn-words">
-                    {u.words.map((w, idx) => {
-                      const isSpoken =
-                        w.start !== null &&
-                        w.end !== null &&
-                        currentTime >= w.start &&
-                        currentTime <= w.end + 0.08;
-                      const isNbz = w.text.includes("[НБЗ]");
-                      return (
-                        <React.Fragment key={`${u.id}-${idx}`}>
-                          <button
-                            type="button"
-                            className={`word-token ${isSpoken ? "spoken" : ""} ${isNbz ? "censored" : ""}`}
-                            onClick={() => seekTo(w.start ?? u.start_sec)}
-                          >
-                            {w.text}
-                          </button>{" "}
-                        </React.Fragment>
-                      );
-                    })}
-                  </div>
-                ) : (
-                  <div className="turn-words">{u.text}</div>
-                )}
-              </div>
-            );
-          })}
-        </div>
+                      <span>
+                        {th.text}
+                        {th.needs_review && (
+                          <span className="review-badge" title="Низкое буквальное пересечение с репликами — рекомендуется сверка">
+                            требует сверки
+                          </span>
+                        )}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            )}
+
+            {/* 3. Ключевые понятия */}
+            {summary.key_concepts.length > 0 && (
+              <section>
+                <h3 className="summary-section-title">Ключевые понятия</h3>
+                <ul className="summary-list">
+                  {summary.key_concepts.map((c, idx) => (
+                    <li key={idx} style={{ lineHeight: 1.6, fontSize: "0.94rem" }}>
+                      <strong>{c.term}</strong> — {c.definition}
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            )}
+
+            {/* 4. Задачи и решения */}
+            <section>
+              <h3 className="summary-section-title">Задачи и решения</h3>
+              {summary.tasks_decisions.length > 0 ? (
+                <ul className="summary-list">
+                  {summary.tasks_decisions.map((t, idx) => (
+                    <li key={idx} style={{ lineHeight: 1.6, fontSize: "0.94rem" }}>
+                      • {t}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <div style={{ fontSize: "0.9rem", color: "var(--text-muted)" }}>
+                  Организационных поручений в записи не зафиксировано.
+                </div>
+              )}
+            </section>
+
+            {/* 5. Вопросы для самопроверки */}
+            {summary.self_check_questions.length > 0 && (
+              <section>
+                <h3 className="summary-section-title">Вопросы для самопроверки</h3>
+                <ol style={{ margin: 0, paddingLeft: "1.2rem", display: "flex", flexDirection: "column", gap: "0.5rem", fontSize: "0.94rem", lineHeight: 1.6 }}>
+                  {summary.self_check_questions.map((q, idx) => (
+                    <li key={idx}>{q}</li>
+                  ))}
+                </ol>
+              </section>
+            )}
+
+            {/* Сущности (NER) */}
+            {entityChips.length > 0 && (
+              <section>
+                <h3 className="summary-section-title">Упомянутые термины, авторы и даты</h3>
+                <div className="entity-tags">
+                  {entityChips.map((chip, idx) => (
+                    <span key={idx} className="entity-tag">
+                      {chip}
+                    </span>
+                  ))}
+                </div>
+              </section>
+            )}
+
+            <div className="summary-footer">
+              <span>Модель конспекта: {summary.model_name}</span>
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm"
+                disabled={summarizing}
+                onClick={handleRegenerateSummary}
+              >
+                {summarizing ? "Обновление…" : "Обновить конспект"}
+              </button>
+            </div>
+          </div>
+        )
       )}
     </div>
   );
