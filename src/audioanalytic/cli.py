@@ -7,9 +7,11 @@ import os
 import sys
 from pathlib import Path
 
-from .config import ServerSettings, SttConfig, load_dotenv
+from .config import LlmConfig, ServerSettings, SttConfig, load_dotenv
+from .exporters import build_markdown
 from .formatting import build_turns, chunk_for_llm, to_text
 from .models import UNKNOWN_SPEAKER, Transcript
+from .summarizer import generate_summary_for_turns, probe_llm_service
 from .winfix import (
     allow_pyannote_unpickling,
     check_ffmpeg,
@@ -267,8 +269,81 @@ def _cmd_doctor(_a: argparse.Namespace) -> int:
     for name, good, note in disk_report_lines():
         report(name, good, note)
 
+    llm_info = probe_llm_service(LlmConfig(), timeout=1.5)
+    if llm_info["reachable"]:
+        report(
+            "локальная LLM (конспект)",
+            True,
+            f"{llm_info['provider']} на {llm_info['base_url']} — активна модель {llm_info['selected_model']}",
+        )
+    else:
+        report(
+            "локальная LLM (конспект)",
+            True,
+            f"Ollama не запущена ({llm_info['base_url']}) — будет использован встроенный резервный конспект",
+        )
+
     print("Готов к работе" if ok else "Есть проблемы — см. строки с [!!]")
     return 0 if ok else 1
+
+
+def _cmd_summarize(a: argparse.Namespace) -> int:
+    """Формирует структурированный конспект (summary.md + summary.json) по transcript.json (FR-05)."""
+    from .lexicon import load_terms
+
+    tr_file = Path(a.transcript)
+    if not tr_file.is_file():
+        print(f"Файл не найден: {tr_file}", file=sys.stderr)
+        return 2
+    tr = Transcript.from_dict(json.loads(tr_file.read_text(encoding="utf-8")))
+    turns_objs = build_turns(tr)
+    turns = [
+        {"start_sec": t.start, "end_sec": t.end, "speaker": t.speaker, "text": t.text}
+        for t in turns_objs
+    ]
+    llm_cfg = LlmConfig()
+    if a.model:
+        llm_cfg.model = a.model
+    known_terms = load_terms(a.terms) if a.terms else []
+    summary = generate_summary_for_turns(
+        turns,
+        title=a.title or tr_file.parent.name,
+        cfg=llm_cfg,
+        known_terms=known_terms,
+    )
+    summary_dict = {
+        "model_name": summary.model_name,
+        "goal": summary.goal,
+        "key_concepts": summary.key_concepts,
+        "theses": [
+            {
+                "seq_num": th.seq_num,
+                "text": th.text,
+                "timecode_sec": th.timecode_sec,
+                "timecode_formatted": th.timecode_formatted,
+                "confidence": th.confidence,
+                "needs_review": th.needs_review,
+            }
+            for th in summary.theses
+        ],
+        "tasks_decisions": summary.tasks_decisions,
+        "self_check_questions": summary.self_check_questions,
+        "entities": summary.entities,
+    }
+    out_dir = tr_file.parent
+    (out_dir / "summary.json").write_text(
+        json.dumps(summary_dict, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    md_text = build_markdown(
+        title=a.title or tr_file.parent.name,
+        duration_sec=tr.duration,
+        word_count=sum(len(t["text"].split()) for t in turns),
+        utterances=turns,
+        summary=summary_dict,
+    )
+    (out_dir / "summary.md").write_text(md_text, encoding="utf-8")
+    print(f"Конспект сохранён ({summary.model_name}) -> {out_dir / 'summary.md'}")
+    return 0
 
 
 def _cmd_check(a: argparse.Namespace) -> int:
@@ -422,6 +497,13 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("transcript")
     c.add_argument("--max-chars", type=int, default=12000)
     c.set_defaults(fn=_cmd_chunks)
+
+    sm = sub.add_parser("summarize", help="transcript.json -> конспект summary.md и summary.json (FR-05)")
+    sm.add_argument("transcript", help="путь к transcript.json")
+    sm.add_argument("--model", help="имя модели в Ollama / API (по умолчанию qwen2.5:3b)")
+    sm.add_argument("--title", help="название занятия для заголовка конспекта")
+    sm.add_argument("--terms", help="словарь академических терминов")
+    sm.set_defaults(fn=_cmd_summarize)
 
     d = sub.add_parser("doctor", help="проверка окружения (ffmpeg, CUDA, whisperx, HF_TOKEN, диаризация)")
     d.set_defaults(fn=_cmd_doctor)

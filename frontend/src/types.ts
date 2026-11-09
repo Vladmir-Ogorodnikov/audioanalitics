@@ -29,6 +29,33 @@ export interface TranscriptData {
   utterances: UtteranceItem[];
 }
 
+export interface KeyConceptItem {
+  term: string;
+  definition: string;
+}
+
+export interface ThesisItem {
+  id: number;
+  seq_num: number;
+  text: string;
+  timecode_sec: number;
+  timecode_formatted: string;
+  confidence: number;
+  needs_review: boolean;
+}
+
+export interface SummaryData {
+  id: number;
+  model_name: string;
+  goal: string;
+  key_concepts: KeyConceptItem[];
+  theses: ThesisItem[];
+  tasks_decisions: string[];
+  self_check_questions: string[];
+  entities: Record<string, string[]>;
+  updated_at: string | null;
+}
+
 export interface RecordingSummary {
   id: number;
   title: string;
@@ -59,5 +86,7 @@ export interface RecordingDetail extends RecordingSummary {
   requested_speakers: number | null;
   diarize_enabled: boolean;
   low_vram: boolean;
+  speed_preset?: string;
   transcript: TranscriptData | null;
+  summary: SummaryData | null;
 }

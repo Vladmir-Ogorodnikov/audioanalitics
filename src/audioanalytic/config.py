@@ -136,6 +136,32 @@ class SttConfig:
 
 
 @dataclass
+class LlmConfig:
+    """Настройки языковой модели для аналитического контура (FR-05, FR-06, NFR-04.2)."""
+    base_url: str = field(
+        default_factory=lambda: os.environ.get("LLM_BASE_URL", "http://127.0.0.1:11434/v1").rstrip("/")
+    )
+    model: str = field(
+        default_factory=lambda: os.environ.get("LLM_MODEL", "qwen2.5:3b")
+    )
+    api_key: str = field(
+        default_factory=lambda: os.environ.get("LLM_API_KEY", "")
+    )
+    timeout_sec: float = field(
+        default_factory=lambda: float(os.environ.get("LLM_TIMEOUT_SEC", "120"))
+    )
+    max_chunk_chars: int = field(
+        default_factory=lambda: int(os.environ.get("LLM_MAX_CHUNK_CHARS", "12000"))
+    )
+    temperature: float = 0.15
+
+    @property
+    def is_localhost(self) -> bool:
+        low = self.base_url.lower()
+        return any(h in low for h in ("127.0.0.1", "localhost", "[::1]"))
+
+
+@dataclass
 class ServerSettings:
     """Настройки локального сервера (FastAPI + БД + изоляция 152-ФЗ)."""
     host: str = field(default_factory=lambda: os.environ.get("AUDIOANALYTIC_HOST", "127.0.0.1"))
@@ -149,6 +175,10 @@ class ServerSettings:
     model_cache_idle_sec: float = field(
         default_factory=lambda: float(os.environ.get("AUDIOANALYTIC_CACHE_IDLE_SEC", "300"))
     )
+    auto_summarize: bool = field(
+        default_factory=lambda: os.environ.get("AUDIOANALYTIC_AUTO_SUMMARIZE", "1") not in ("0", "false", "False")
+    )
+    llm: LlmConfig = field(default_factory=LlmConfig)
 
     def __post_init__(self) -> None:
         if not self.database_url:

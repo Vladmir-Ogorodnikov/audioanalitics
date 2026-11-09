@@ -109,6 +109,24 @@ DEFAULT_MODELS_SEED = [
     },
     {
         "component": "llm",
+        "model_name": "Qwen/Qwen2.5-3B-Instruct (qwen2.5:3b)",
+        "version": "2.5-3B (Ollama)",
+        "source_url": "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct",
+        "license": "Apache-2.0 / Qwen Research",
+        "quantization": "Q4_K_M (4 бит)",
+        "vram_mb": 1950,
+        "metrics_json": json.dumps(
+            {
+                "target_hallucination_rate_le": 0.02,
+                "stage": "Спринт 2 — Конспект, таймкоды и NER",
+                "endpoint": "http://127.0.0.1:11434/v1",
+            },
+            ensure_ascii=False,
+        ),
+        "is_active": True,
+    },
+    {
+        "component": "llm_optional",
         "model_name": "Meta-Llama-3.1-8B-Instruct-GGUF",
         "version": "3.1-8B",
         "source_url": "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
@@ -116,7 +134,7 @@ DEFAULT_MODELS_SEED = [
         "quantization": "Q4_K_M / Q6_K (4–8 бит)",
         "vram_mb": 5600,
         "metrics_json": json.dumps(
-            {"target_hallucination_rate_le": 0.02, "stage": "Этап 3 (Спринт 2 — Конспект)"},
+            {"target_hallucination_rate_le": 0.02, "stage": "Альтернативная модель 8B"},
             ensure_ascii=False,
         ),
         "is_active": False,
